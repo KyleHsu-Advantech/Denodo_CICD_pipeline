@@ -31,6 +31,8 @@ variables:
 steps:
 - script: |
     echo Hello, world!
+    echo "1) 巨集直接印: $(revisionName)"
+    echo "2) 環境變數印: $REVISION_NAME"
     python create_and_deploy.py \
       --name "$REVISION_NAME" \
   displayName: 'Run a one-line script'

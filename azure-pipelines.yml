@@ -3,17 +3,37 @@
 # Add steps that build, run tests, deploy, and more:
 # https://aka.ms/yaml
 
-trigger:
-- none
+parameters:
+- name: revisionName
+  type: string
+  default: ''
+- name: revisionDescription
+  type: string
+  default: ''
+- name: environmentId
+  type: string
+  default: ''
+- name: vqlContentBase64
+  type: string
+  default: ''
+- name: propertiesBase64
+  type: string
+  default: ''
+
+trigger: none
 
 pool:
   vmImage: ubuntu-latest
 
 steps:
 - script: echo Hello, world!
+    python create_and_deploy.py \
+      --name "$REVISION_NAME" \
   displayName: 'Run a one-line script'
 
 - script: |
     echo Add other tasks to build, test, and deploy your project.
     echo See https://aka.ms/yaml
   displayName: 'Run a multi-line script'
+env:
+    REVISION_NAME: $(revisionName)

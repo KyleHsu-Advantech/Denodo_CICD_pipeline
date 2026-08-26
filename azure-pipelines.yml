@@ -30,6 +30,8 @@ steps:
     python create_and_deploy.py \
       --name "$REVISION_NAME" \
   displayName: 'Run a one-line script'
+  env:
+    REVISION_NAME: $(revisionName)
 
 - script: |
     echo Add other tasks to build, test, and deploy your project.

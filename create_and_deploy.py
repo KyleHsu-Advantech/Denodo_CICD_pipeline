@@ -20,4 +20,4 @@ import requests
 parser = argparse.ArgumentParser(description="Denodo Solution Manager CI deployment")
 parser.add_argument("--name", required=True, help="Revision name")
 args = parser.parse_args()
-return args.name
+print(args.name)

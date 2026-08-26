@@ -10,14 +10,9 @@
 """
  
 import argparse
-import base64
-import os
-import time
-from datetime import datetime
- 
-import requests
 
 parser = argparse.ArgumentParser(description="Denodo Solution Manager CI deployment")
 parser.add_argument("--name", required=True, help="Revision name")
 args = parser.parse_args()
-print(args.name)
+
+print(f"收到的 name 參數是: {args.name}")

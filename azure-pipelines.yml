@@ -1,45 +1,88 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
+# Denodo 自動上版 pipeline（經由 APIM 連線內網 Solution Manager）
+# 僅接受 API 或手動觸發，避免與來源端的 push 重複觸發
+trigger: none
+pr: none
 
 parameters:
-- name: revisionName
-  type: string
-  default: ''
-- name: revisionDescription
-  type: string
-  default: ''
-- name: environmentId
-  type: string
-  default: ''
-- name: vqlContentBase64
-  type: string
-  default: ''
-- name: propertiesBase64
-  type: string
-  default: ''
+  # 分階段驗證：environments → servers → revision → validate → deploy
+  # 第一次請用 environments，確認 APIM 的 token 流程與轉送都正常
+  - name: stage
+    type: string
+    default: environments
+    values:
+      - environments
+      - servers
+      - revision
+      - validate
+      - deploy
 
-trigger: none
+  - name: revisionName
+    type: string
+    default: ''
+  - name: revisionDescription
+    type: string
+    default: ''
+  - name: environmentId
+    type: string
+    default: ''
+  - name: clusterId
+    type: string
+    default: ''
+  - name: vqlContentBase64
+    type: string
+    default: ''
+  - name: propertiesBase64
+    type: string
+    default: ''
 
 pool:
   vmImage: ubuntu-latest
-  
-variables:
-  revisionName: ${{ parameters.revisionName }}
-  
-steps:
-- script: |
-    echo Hello, world!
-    echo "1) 巨集直接印: $(revisionName)"
-    echo "2) 環境變數印: $REVISION_NAME"
-    python create_and_deploy.py \
-      --name "$REVISION_NAME" \
-  displayName: 'Run a one-line script'
-  env:
-    REVISION_NAME: $(revisionName)
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+variables:
+  # 在 ADO 的 Pipelines → Library 建立名為 denodo-apim 的 variable group，
+  # 內含 apimBaseUrl / apimSubscriptionKey / apimLoginEmail / apimLoginPassword
+  # 後三者請按鎖頭圖示設為 secret。
+  - group: denodo-apim
+
+name: $(Date:yyyyMMdd)$(Rev:.r)-${{ parameters.stage }}
+
+steps:
+  - checkout: self
+
+  - script: |
+      echo "stage         = ${{ parameters.stage }}"
+      echo "revisionName  = ${{ parameters.revisionName }}"
+      echo "environmentId = ${{ parameters.environmentId }}"
+      echo "clusterId     = ${{ parameters.clusterId }}"
+      echo "vql base64 長度 = ${#VQL_B64}"
+    displayName: 記錄輸入參數
+    env:
+      VQL_B64: ${{ parameters.vqlContentBase64 }}
+
+  - script: python -m pip install --upgrade pip requests
+    displayName: 安裝相依套件
+
+  - task: PythonScript@0
+    displayName: 呼叫 Denodo Solution Manager
+    inputs:
+      scriptPath: create_and_deploy.py
+      arguments: >-
+        --stage "${{ parameters.stage }}"
+        --name "${{ parameters.revisionName }}"
+        --description "${{ parameters.revisionDescription }}"
+        --vql-base64 "${{ parameters.vqlContentBase64 }}"
+        --properties-base64 "${{ parameters.propertiesBase64 }}"
+        --environment-id "${{ parameters.environmentId }}"
+        --cluster-id "${{ parameters.clusterId }}"
+    env:
+      APIM_BASE_URL: $(apimBaseUrl)
+      # secret 變數不會自動注入環境，必須在這裡顯式對應
+      APIM_SUBSCRIPTION_KEY: $(apimSubscriptionKey)
+      APIM_LOGIN_EMAIL: $(apimLoginEmail)
+      APIM_LOGIN_PASSWORD: $(apimLoginPassword)
+
+  - script: |
+      echo "revision   = $(revisionId)"
+      echo "deployment = $(deploymentId)"
+    displayName: 輸出結果編號
+    condition: succeededOrFailed()

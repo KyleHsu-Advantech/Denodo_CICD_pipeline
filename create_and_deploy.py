@@ -135,8 +135,12 @@ def _headers(json_body=True):
     return h
 
 
-def _request(method, path, **kwargs):
-    """對 SM API 發出請求，失敗時印出完整回應以利除錯。"""
+def _request(method, path, allow_404=False, **kwargs):
+    """對 SM API 發出請求，失敗時印出完整回應以利除錯。
+
+    allow_404=True 時，404 不視為致命錯誤，回傳 None 由呼叫端決定如何處理。
+    用於 APIM 上可能尚未發布的 operation。
+    """
     url = BASE_URL + SM_PREFIX + path
     log("%s %s" % (method, url))
 
@@ -154,6 +158,10 @@ def _request(method, path, **kwargs):
         fail("連線失敗：%s" % exc)
 
     log("HTTP %d" % resp.status_code)
+
+    if resp.status_code == 404 and allow_404:
+        log("此 operation 在 APIM 上不存在（404），略過")
+        return None
 
     if resp.status_code >= 400:
         log("回應內容：%s" % resp.text[:2000])
@@ -186,7 +194,11 @@ def list_environments(quiet=False):
         log("完整回應：%s"
             % json.dumps(data, ensure_ascii=False, indent=2)[:3000])
 
-    items = data if isinstance(data, list) else data.get("items", [])
+    if isinstance(data, list):
+        items = data
+    else:
+        items = data.get("environments") or data.get("items") or []
+
     log("")
     log("環境摘要：")
     for env in items:
@@ -224,10 +236,16 @@ def resolve_environment_id(environments, wanted):
 
 # ---------------------------------------------------------------- 2. 伺服器清單
 
-def list_servers(environment_id):
+def list_servers(environment_id, allow_missing=False):
     log("")
     log("--- 取得環境 %s 的伺服器 ---" % environment_id)
-    resp = _request("GET", "/environments/%s/servers" % environment_id)
+    resp = _request("GET", "/environments/%s/servers" % environment_id,
+                    allow_404=allow_missing)
+
+    if resp is None:
+        log("提示：APIM 尚未發布 /environments/{id}/servers，")
+        log("      無法自動推導 clusterId。")
+        return None
 
     try:
         data = resp.json()
@@ -236,7 +254,12 @@ def list_servers(environment_id):
 
     log("完整回應：%s" % json.dumps(data, ensure_ascii=False, indent=2)[:3000])
 
-    items = data if isinstance(data, list) else data.get("items", [])
+    if isinstance(data, list):
+        items = data
+    else:
+        # SM 實際回傳 {"servers": [...]}；保留其他鍵名以防版本差異
+        items = data.get("servers") or data.get("items") or []
+
     log("")
     log("伺服器摘要：")
     for srv in items:
@@ -266,8 +289,9 @@ def pick_cluster_id(servers):
             continue
         node_type = str(srv.get("typeNode", "")).upper()
         enabled = srv.get("enabled")
-        # 欄位名稱若與預期不同，放寬條件避免誤判為沒有候選
-        if node_type and "VDP" not in node_type:
+        # 只取 VDP 節點。注意 VDP_DATA_CATALOG 與 SCHEDULER 都不是部署目標，
+        # 因此必須精確比對，不能用子字串判斷。
+        if node_type and node_type != "VDP":
             continue
         if enabled is False:
             continue
@@ -468,20 +492,31 @@ def main():
         fail("stage=%s 需要 --environment（名稱或 id）" % args.stage)
     environment_id = resolve_environment_id(environments, args.environment)
 
-    # 階段 2：伺服器與 clusterId
-    servers = list_servers(environment_id)
-
+    # 階段 2：決定 clusterId
+    # 1) 有明確指定就直接用，不必呼叫 /servers
+    # 2) 未指定則嘗試由 /servers 推導
+    # 3) APIM 上若未發布 /servers，不中斷，改為不帶 clusterId 送出部署
+    cluster_id = None
     if args.cluster_id and args.cluster_id != "-":
         cluster_id = int(args.cluster_id)
-        log("使用指定的 clusterId = %s" % cluster_id)
+        log("")
+        log("使用指定的 clusterId = %s（略過 /servers 查詢）" % cluster_id)
     else:
-        cluster_id = pick_cluster_id(servers)
+        servers = list_servers(environment_id, allow_missing=True)
+        if servers:
+            cluster_id = pick_cluster_id(servers)
+        else:
+            log("")
+            log("##[warning]未取得 clusterId，部署將不指定 cluster，")
+            log("##[warning]由 Solution Manager 自行決定目標。")
+            log("##[warning]若需指定，請在 APIM 發布 /environments/{id}/servers，")
+            log("##[warning]或於 clusterId 參數明確填入。")
 
     if args.stage == "servers":
         log("")
         log("stage=servers，就此結束")
         log("後續部署可用：environmentId=%s clusterId=%s"
-            % (environment_id, cluster_id))
+            % (environment_id, cluster_id if cluster_id else "(未指定)"))
         return
 
     # 階段 3：建立 revision

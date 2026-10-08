@@ -172,7 +172,7 @@ def _request(method, path, **kwargs):
 
 # ---------------------------------------------------------------- 1. 環境清單
 
-def list_environments():
+def list_environments(quiet=False):
     log("")
     log("--- 取得環境清單 ---")
     resp = _request("GET", "/environments")
@@ -182,7 +182,9 @@ def list_environments():
     except ValueError:
         fail("環境清單回應非 JSON：%s" % resp.text[:500])
 
-    log("完整回應：%s" % json.dumps(data, ensure_ascii=False, indent=2)[:3000])
+    if not quiet:
+        log("完整回應：%s"
+            % json.dumps(data, ensure_ascii=False, indent=2)[:3000])
 
     items = data if isinstance(data, list) else data.get("items", [])
     log("")
@@ -191,6 +193,33 @@ def list_environments():
         log("  id=%s  name=%s" % (env.get("id"), env.get("name")))
 
     return items
+
+
+def resolve_environment_id(environments, wanted):
+    """把使用者給的環境名稱或 id 解析成實際的 environment id。
+
+    接受 "ACLDTPLTFRM-PRD" 這種名稱，也接受純數字 id。
+    名稱比對不分大小寫。
+    """
+    wanted = str(wanted).strip()
+
+    # 純數字就直接當 id 用，但仍確認它存在
+    if wanted.isdigit():
+        for env in environments:
+            if str(env.get("id")) == wanted:
+                log("目標環境：id=%s name=%s"
+                    % (env.get("id"), env.get("name")))
+                return int(wanted)
+        fail("環境清單中找不到 id=%s" % wanted)
+
+    for env in environments:
+        if str(env.get("name", "")).strip().lower() == wanted.lower():
+            log("目標環境：name=%s 解析為 id=%s"
+                % (env.get("name"), env.get("id")))
+            return int(env["id"])
+
+    names = ", ".join(str(e.get("name")) for e in environments)
+    fail("環境清單中找不到名稱 %s。可用的環境：%s" % (wanted, names))
 
 
 # ---------------------------------------------------------------- 2. 伺服器清單
@@ -222,6 +251,44 @@ def list_servers(environment_id):
         log("可用的 clusterId：%s" % ", ".join(cluster_ids))
 
     return items
+
+
+def pick_cluster_id(servers):
+    """由 server 清單推導出要部署的 clusterId。
+
+    只取啟用中的 VDP 節點。若找不到或有多個，不靜默猜測，
+    而是印出完整資訊要求明確指定。
+    """
+    candidates = []
+    for srv in servers:
+        cid = srv.get("clusterId")
+        if cid is None:
+            continue
+        node_type = str(srv.get("typeNode", "")).upper()
+        enabled = srv.get("enabled")
+        # 欄位名稱若與預期不同，放寬條件避免誤判為沒有候選
+        if node_type and "VDP" not in node_type:
+            continue
+        if enabled is False:
+            continue
+        candidates.append((int(cid), srv.get("name")))
+
+    unique = sorted({c for c, _ in candidates})
+
+    if not unique:
+        log("servers 完整內容：%s"
+            % json.dumps(servers, ensure_ascii=False, indent=2)[:2000])
+        fail("無法從 server 清單推導 clusterId，請以 --cluster-id 明確指定")
+
+    if len(unique) > 1:
+        log("偵測到多個 clusterId：%s"
+            % ", ".join(str(c) for c in unique))
+        for cid, name in candidates:
+            log("  clusterId=%s server=%s" % (cid, name))
+        fail("目標環境有多個 cluster，請以 --cluster-id 明確指定要部署的那一個")
+
+    log("自動推導 clusterId = %s" % unique[0])
+    return unique[0]
 
 
 # ---------------------------------------------------------------- 3. 建立 Revision
@@ -368,8 +435,11 @@ def main():
                     help="VQL 內容，base64 編碼的 UTF-8，不得含 BOM")
     ap.add_argument("--properties-base64", default="",
                     help="選填。環境專屬 properties 檔內容，base64")
-    ap.add_argument("--environment-id", default="", help="目標環境 id")
-    ap.add_argument("--cluster-id", default="", help="目標 cluster id")
+    ap.add_argument("--environment", "--environment-id", dest="environment",
+                    default="",
+                    help="目標環境，可填名稱（如 ACLDTPLTFRM-PRD）或數字 id")
+    ap.add_argument("--cluster-id", default="",
+                    help="選填。留空則由目標環境的 server 清單自動推導")
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--interval", type=int, default=10)
     args = ap.parse_args()
@@ -387,28 +457,44 @@ def main():
     get_token()
 
     # 階段 1：環境清單
-    list_environments()
+    environments = list_environments()
     if args.stage == "environments":
         log("")
         log("stage=environments，就此結束")
         return
 
+    # 把名稱或 id 解析成實際的 environment id
+    if not args.environment or args.environment == "-":
+        fail("stage=%s 需要 --environment（名稱或 id）" % args.stage)
+    environment_id = resolve_environment_id(environments, args.environment)
+
     # 階段 2：伺服器與 clusterId
-    if not args.environment_id:
-        fail("stage=%s 需要 --environment-id" % args.stage)
-    list_servers(args.environment_id)
+    servers = list_servers(environment_id)
+
+    if args.cluster_id and args.cluster_id != "-":
+        cluster_id = int(args.cluster_id)
+        log("使用指定的 clusterId = %s" % cluster_id)
+    else:
+        cluster_id = pick_cluster_id(servers)
+
     if args.stage == "servers":
         log("")
         log("stage=servers，就此結束")
+        log("後續部署可用：environmentId=%s clusterId=%s"
+            % (environment_id, cluster_id))
         return
 
     # 階段 3：建立 revision
-    if not args.name or not args.vql_base64:
-        fail("stage=%s 需要 --name 與 --vql-base64" % args.stage)
+    placeholder = {"", "-"}
+    if args.name in placeholder or args.vql_base64 in placeholder:
+        fail("stage=%s 需要 --name 與 --vql-base64（目前是空值或占位符）"
+             % args.stage)
 
     revision_id = create_revision(
-        args.name, args.description,
-        args.vql_base64, args.properties_base64 or None)
+        args.name,
+        "" if args.description in placeholder else args.description,
+        args.vql_base64,
+        None if args.properties_base64 in placeholder else args.properties_base64)
     log("##vso[task.setvariable variable=revisionId]%s" % revision_id)
 
     if args.stage == "revision":
@@ -425,7 +511,7 @@ def main():
 
     # 階段 5、6：部署並等待完成
     deployment_id = start_deployment(
-        revision_id, args.environment_id, args.cluster_id or None)
+        revision_id, environment_id, cluster_id)
     log("##vso[task.setvariable variable=deploymentId]%s" % deployment_id)
 
     wait_for_deployment(deployment_id, args.timeout, args.interval)

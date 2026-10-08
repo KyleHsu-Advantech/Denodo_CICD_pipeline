@@ -42,7 +42,7 @@ variables:
   # 在 ADO 的 Pipelines → Library 建立名為 denodo-apim 的 variable group，
   # 內含 apimBaseUrl / apimSubscriptionKey / apimLoginEmail / apimLoginPassword
   # 後三者請按鎖頭圖示設為 secret。
-  - group: denodo-apim
+  - group: denodo-apim-cicd
 
 name: $(Date:yyyyMMdd)$(Rev:.r)-${{ parameters.stage }}
 

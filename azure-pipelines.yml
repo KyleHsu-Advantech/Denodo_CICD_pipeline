@@ -5,7 +5,7 @@ pr: none
 
 parameters:
   # 分階段驗證：environments → servers → revision → validate → deploy
-  # 第一次請用 environments，確認 APIM 的 token 流程與轉送都正常
+  # revision 與 validate 不會變動任何環境，可安心執行
   - name: stage
     type: string
     default: environments
@@ -16,32 +16,35 @@ parameters:
       - validate
       - deploy
 
-  - name: revisionName
+  # 目標環境，可填名稱或數字 id，腳本會自動解析
+  - name: environment
     type: string
-    default: ''
-  - name: revisionDescription
-    type: string
-    default: ''
-  - name: environmentId
-    type: string
-    default: ''
+    default: ACLDTPLTFRM-PRD
+
+  # 留空或填 - 時由腳本從目標環境的 server 清單自動推導
   - name: clusterId
     type: string
-    default: ''
+    default: '-'
+
+  - name: revisionName
+    type: string
+    default: '-'
+  - name: revisionDescription
+    type: string
+    default: '-'
   - name: vqlContentBase64
     type: string
-    default: ''
+    default: '-'
   - name: propertiesBase64
     type: string
-    default: ''
+    default: '-'
 
 pool:
   vmImage: ubuntu-latest
 
 variables:
-  # 在 ADO 的 Pipelines → Library 建立名為 denodo-apim 的 variable group，
-  # 內含 apimBaseUrl / apimSubscriptionKey / apimLoginEmail / apimLoginPassword
-  # 後三者請按鎖頭圖示設為 secret。
+  # ADO 的 Pipelines → Library 中的 variable group，內含
+  # apimBaseUrl / apimSubscriptionKey / apimLoginEmail / apimLoginPassword
   - group: denodo-apim-cicd
 
 name: $(Date:yyyyMMdd)$(Rev:.r)-${{ parameters.stage }}
@@ -50,10 +53,10 @@ steps:
   - checkout: self
 
   - script: |
-      echo "stage         = ${{ parameters.stage }}"
-      echo "revisionName  = ${{ parameters.revisionName }}"
-      echo "environmentId = ${{ parameters.environmentId }}"
-      echo "clusterId     = ${{ parameters.clusterId }}"
+      echo "stage       = ${{ parameters.stage }}"
+      echo "environment = ${{ parameters.environment }}"
+      echo "clusterId   = ${{ parameters.clusterId }}"
+      echo "revisionName = ${{ parameters.revisionName }}"
       echo "vql base64 長度 = ${#VQL_B64}"
     displayName: 記錄輸入參數
     env:
@@ -68,12 +71,12 @@ steps:
       scriptPath: create_and_deploy.py
       arguments: >-
         --stage "${{ parameters.stage }}"
+        --environment "${{ parameters.environment }}"
+        --cluster-id "${{ parameters.clusterId }}"
         --name "${{ parameters.revisionName }}"
         --description "${{ parameters.revisionDescription }}"
         --vql-base64 "${{ parameters.vqlContentBase64 }}"
         --properties-base64 "${{ parameters.propertiesBase64 }}"
-        --environment-id "${{ parameters.environmentId }}"
-        --cluster-id "${{ parameters.clusterId }}"
     env:
       APIM_BASE_URL: $(apimBaseUrl)
       # secret 變數不會自動注入環境，必須在這裡顯式對應
@@ -81,8 +84,13 @@ steps:
       APIM_LOGIN_EMAIL: $(apimLoginEmail)
       APIM_LOGIN_PASSWORD: $(apimLoginPassword)
 
+  # 只在真的產生了編號時才輸出，避免變數未定義造成的噪音
   - script: |
-      echo "revision   = $(revisionId)"
-      echo "deployment = $(deploymentId)"
+      [ -n "${REVISION_ID}" ] && echo "revision   = ${REVISION_ID}"
+      [ -n "${DEPLOYMENT_ID}" ] && echo "deployment = ${DEPLOYMENT_ID}"
+      exit 0
     displayName: 輸出結果編號
     condition: succeededOrFailed()
+    env:
+      REVISION_ID: $(revisionId)
+      DEPLOYMENT_ID: $(deploymentId)

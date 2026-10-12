@@ -28,7 +28,8 @@ parameters:
     type: string
     default: admin
 
-  # VQL 加工：DROP+CREATE 轉 CREATE OR REPLACE，並補上 CONNECT DATABASE
+  # VQL 加工（保險機制）。DESC 選項正確時輸出本來就不含 DROP，
+  # 此加工會偵測到無事可做而不變更內容；僅在選項未生效時才補救。
   - name: transformVql
     type: string
     default: 'true'
@@ -39,6 +40,18 @@ parameters:
     type: string
     default: 'false'
     values: ['false', 'true']
+
+  # DESC VQL 的匯出選項，格式 key=value,key2=value2。
+  # 留空使用預設：
+  #   includeDependencies=yes                        一併匯出相依物件
+  #   include_dependencies_from_all_databases=yes    跨 database 相依一併納入
+  #   dropElements=no                                不產生 DROP 語句
+  #   replaceExistingElements=yes                    產生 CREATE OR REPLACE
+  # 其他可用：includeStatistics、format_vql、
+  #           includeEnvSpecificElements、includeNonEnvSpecificElements
+  - name: descOptions
+    type: string
+    default: ''
 
   # APIM 上 DESC API 的路徑，接在 SM 前綴之後
   - name: descApiPath
@@ -125,6 +138,7 @@ steps:
         --stage "${{ parameters.stage }}"
         --components "${{ parameters.components }}"
         --desc-api-path "${{ parameters.descApiPath }}"
+        --desc-options "${{ parameters.descOptions }}"
         --database "${{ parameters.database }}"
         ${{ if eq(parameters.transformVql, 'false') }}:
           --no-transform

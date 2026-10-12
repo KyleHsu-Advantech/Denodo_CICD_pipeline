@@ -47,6 +47,24 @@ LOGIN_EMAIL = os.environ.get("APIM_LOGIN_EMAIL", "")
 LOGIN_PASSWORD = os.environ.get("APIM_LOGIN_PASSWORD", "")
 
 LOGIN_PATH = "/user/api/user/login"
+
+# DESC VQL 的匯出選項，由 DESC API 轉交給 Denodo。
+#   includeDependencies
+#       一併匯出被引用的物件，否則只會得到目標 view 本身。
+#   include_dependencies_from_all_databases
+#       相依物件跨 database 時一併納入，並在開頭區塊依序排列。
+#       未開啟時，跨 db 的相依會缺漏。
+#   dropElements = no
+#       不產生 DROP 語句。預設的 DROP + CREATE 是先刪再建，
+#       刪除瞬間相依物件一併消失，建立失敗會讓目標環境處於破損狀態。
+#   replaceExistingElements = yes
+#       產生 CREATE OR REPLACE，原子替換，失敗時舊物件仍在。
+DEFAULT_DESC_OPTIONS = {
+    "includeDependencies": "yes",
+    "include_dependencies_from_all_databases": "yes",
+    "dropElements": "no",
+    "replaceExistingElements": "yes",
+}
 SM_PREFIX = "/pool/DenodoSolutionManager"
 
 TIMEOUT = 60
@@ -80,6 +98,33 @@ def _mask(s, keep=4):
     if not s:
         return "(空)"
     return s[:keep] + "*" * max(0, len(s) - keep)
+
+
+def parse_desc_options(raw):
+    """把 "key=value,key2=value2" 解析為 dict，並覆蓋預設值。
+
+    傳入空值或占位符時使用全部預設值。
+    """
+    options = dict(DEFAULT_DESC_OPTIONS)
+    if not raw or raw in ("", "-"):
+        return options
+
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            fail("DESC 選項格式錯誤：%s（應為 key=value）" % item)
+        k, v = item.split("=", 1)
+        options[k.strip()] = v.strip()
+    return options
+
+
+def build_desc_statement(components, options):
+    """組出對應的 DESC VQL 語句，僅供記錄與對照，實際由 DESC API 執行。"""
+    items = ", ".join("VIEW %s" % c for c in components)
+    opts = ", ".join("'%s' = '%s'" % (k, v) for k, v in sorted(options.items()))
+    return "DESC VQL LIST %s (%s)" % (items, opts)
 
 
 def read_as_base64(path, label):
@@ -214,7 +259,7 @@ def _request(method, path, allow_404=False, **kwargs):
 
 # ------------------------------------------------- 1. 由 DESC API 取得 VQL
 
-def fetch_vql_from_api(components, api_path, database=None,
+def fetch_vql_from_api(components, api_path, options, database=None,
                        transform=True, keep_drop_types=False):
     """呼叫 APIM 上的 DESC API，取回展開相依後的完整 VQL。
 
@@ -228,8 +273,14 @@ def fetch_vql_from_api(components, api_path, database=None,
     log("")
     log("--- 取得完整 VQL（含相依展開）---")
     log("  元件：%s" % ", ".join(components))
+    log("  DESC 選項：")
+    for k, v in sorted(options.items()):
+        log("    %s = %s" % (k, v))
+    log("  對應語句：%s"
+        % build_desc_statement(components, options)[:300])
 
-    resp = _request("POST", api_path, json={"views": components})
+    resp = _request("POST", api_path,
+                    json={"views": components, "options": options})
 
     ctype = resp.headers.get("Content-Type", "")
     if "json" in ctype.lower():
@@ -258,6 +309,24 @@ def fetch_vql_from_api(components, api_path, database=None,
 
     text = raw.decode("utf-8", errors="ignore")
     log("  原始 VQL %d bytes" % len(raw))
+
+    # 檢核 DESC 選項是否確實生效。未生效時後面的加工會補救，
+    # 但問題的根源在 DESC API 的選項沒有傳對，應回頭修正。
+    n_drop = len(re.findall(r"^\s*DROP\b", text, re.MULTILINE))
+    n_replace = len(re.findall(r"CREATE\s+OR\s+REPLACE", text, re.IGNORECASE))
+    n_connect = len(re.findall(r"^\s*CONNECT\s+DATABASE",
+                               text, re.IGNORECASE | re.MULTILINE))
+    log("  檢核：DROP %d 行、CREATE OR REPLACE %d 處、CONNECT DATABASE %d 處"
+        % (n_drop, n_replace, n_connect))
+
+    if options.get("dropElements", "").lower() == "no" and n_drop:
+        log("##[warning]已指定 dropElements=no，輸出卻仍含 %d 行 DROP。"
+            "請確認 DESC API 有將選項轉交給 Denodo。" % n_drop)
+    if (options.get("include_dependencies_from_all_databases", "").lower() == "yes"
+            and n_connect == 0):
+        log("##[warning]已指定 include_dependencies_from_all_databases=yes，"
+            "輸出卻無 CONNECT DATABASE。若本次物件橫跨多個 database，"
+            "可能有相依缺漏。")
 
     # 加工：DROP+CREATE 轉 CREATE OR REPLACE、補上 CONNECT DATABASE
     if transform:
@@ -663,6 +732,9 @@ def main():
     ap.add_argument("--keep-drop-types", action="store_true",
                     help="TYPE 保留 DROP+CREATE 原樣。"
                          "若驗證回報 CREATE OR REPLACE TYPE 語法錯誤時使用")
+    ap.add_argument("--desc-options", default="",
+                    help="DESC VQL 匯出選項，格式 key=value,key2=value2。"
+                         "留空則使用預設值（見 DEFAULT_DESC_OPTIONS）")
     ap.add_argument("--desc-api-path", default="/descVql",
                     help="APIM 上 DESC API 的路徑（接在 SM 前綴之後）")
     ap.add_argument("--vql-file", default="",
@@ -744,8 +816,9 @@ def main():
                   if c.strip() and c.strip() != "-"]
 
     if components:
+        desc_options = parse_desc_options(args.desc_options)
         vql_b64 = fetch_vql_from_api(
-            components, args.desc_api_path,
+            components, args.desc_api_path, desc_options,
             database=None if args.database in placeholder else args.database,
             transform=not args.no_transform,
             keep_drop_types=args.keep_drop_types)

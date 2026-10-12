@@ -16,6 +16,35 @@ parameters:
       - validate
       - deploy
 
+  # 要過版的資料表清單，逗號分隔。
+  # 指定後會呼叫 APIM 上的 DESC API 取得展開相依後的完整 VQL。
+  - name: components
+    type: string
+    default: '-'
+
+  # 物件要建立在哪個 database。DESC VQL 不含 CONNECT DATABASE，
+  # 未指定時物件會被建到目標端的預設 database。
+  - name: database
+    type: string
+    default: admin
+
+  # VQL 加工：DROP+CREATE 轉 CREATE OR REPLACE，並補上 CONNECT DATABASE
+  - name: transformVql
+    type: string
+    default: 'true'
+    values: ['true', 'false']
+
+  # 若驗證回報 CREATE OR REPLACE TYPE 語法錯誤，改為 true 讓 TYPE 保留原樣
+  - name: keepDropTypes
+    type: string
+    default: 'false'
+    values: ['false', 'true']
+
+  # APIM 上 DESC API 的路徑，接在 SM 前綴之後
+  - name: descApiPath
+    type: string
+    default: '/descVql'
+
   # 目標環境，可填名稱或數字 id，腳本會自動解析
   - name: environment
     type: string
@@ -32,12 +61,33 @@ parameters:
   - name: revisionDescription
     type: string
     default: '-'
+  # 建議用檔案路徑：VQL 直接 commit 進 repo，腳本自行讀檔、去 BOM、轉 base64
+  # 可避免大型 VQL 超出 pipeline 參數與 APIM body 的大小上限
+  - name: vqlFile
+    type: string
+    default: 'vql/deploy.vql'
+  - name: propertiesFile
+    type: string
+    default: 'vql/deploy.properties'
+
+  # 小型 VQL 臨時測試用，填了會覆蓋上面的檔案路徑
   - name: vqlContentBase64
     type: string
     default: '-'
   - name: propertiesBase64
     type: string
     default: '-'
+
+  # 預設為 false：若有屬性會回退使用開發環境的值，驗證即失敗並中止。
+  # 僅在明確確認過該差異可接受時才改為 true。
+  # 字串而非 boolean：透過 REST API 的 templateParameters 傳入時，
+  # 字串不會有型別轉換的歧義。
+  - name: allowRevisionFallback
+    type: string
+    default: 'false'
+    values:
+      - 'false'
+      - 'true'
 
 pool:
   vmImage: ubuntu-latest
@@ -54,9 +104,11 @@ steps:
 
   - script: |
       echo "stage       = ${{ parameters.stage }}"
+      echo "components  = ${{ parameters.components }}"
       echo "environment = ${{ parameters.environment }}"
       echo "clusterId   = ${{ parameters.clusterId }}"
       echo "revisionName = ${{ parameters.revisionName }}"
+      echo "vqlFile     = ${{ parameters.vqlFile }}"
       echo "vql base64 長度 = ${#VQL_B64}"
     displayName: 記錄輸入參數
     env:
@@ -71,12 +123,23 @@ steps:
       scriptPath: create_and_deploy.py
       arguments: >-
         --stage "${{ parameters.stage }}"
+        --components "${{ parameters.components }}"
+        --desc-api-path "${{ parameters.descApiPath }}"
+        --database "${{ parameters.database }}"
+        ${{ if eq(parameters.transformVql, 'false') }}:
+          --no-transform
+        ${{ if eq(parameters.keepDropTypes, 'true') }}:
+          --keep-drop-types
         --environment "${{ parameters.environment }}"
         --cluster-id "${{ parameters.clusterId }}"
         --name "${{ parameters.revisionName }}"
         --description "${{ parameters.revisionDescription }}"
+        --vql-file "${{ parameters.vqlFile }}"
+        --properties-file "${{ parameters.propertiesFile }}"
         --vql-base64 "${{ parameters.vqlContentBase64 }}"
         --properties-base64 "${{ parameters.propertiesBase64 }}"
+        ${{ if eq(parameters.allowRevisionFallback, 'true') }}:
+          --allow-revision-fallback
     env:
       APIM_BASE_URL: $(apimBaseUrl)
       # secret 變數不會自動注入環境，必須在這裡顯式對應
@@ -84,13 +147,18 @@ steps:
       APIM_LOGIN_EMAIL: $(apimLoginEmail)
       APIM_LOGIN_PASSWORD: $(apimLoginPassword)
 
-  # 只在真的產生了編號時才輸出，避免變數未定義造成的噪音
+  # 輸出結果供呼叫端取用。即使前一步失敗也執行，
+  # 讓 bot 能從 timeline API 取回驗證摘要呈現給使用者。
   - script: |
       [ -n "${REVISION_ID}" ] && echo "revision   = ${REVISION_ID}"
       [ -n "${DEPLOYMENT_ID}" ] && echo "deployment = ${DEPLOYMENT_ID}"
+      [ -n "${VALIDATION_STATE}" ] && echo "validation = ${VALIDATION_STATE}"
+      [ -n "${VALIDATION_SUMMARY}" ] && echo "摘要       = ${VALIDATION_SUMMARY}"
       exit 0
     displayName: 輸出結果編號
     condition: succeededOrFailed()
     env:
       REVISION_ID: $(revisionId)
       DEPLOYMENT_ID: $(deploymentId)
+      VALIDATION_STATE: $(validationState)
+      VALIDATION_SUMMARY: $(validationSummary)

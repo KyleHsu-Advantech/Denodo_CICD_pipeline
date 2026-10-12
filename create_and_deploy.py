@@ -637,46 +637,135 @@ def validate_revision(revision_id, environment_id, description,
 
 # ---------------------------------------------------------------- 5. 觸發部署
 
-def start_deployment(revision_id, environment_id, cluster_id=None):
+def start_deployment(revision_ids, environment_id, description=""):
+    """觸發部署。
+
+    依官方文件，body 必須包含：
+      revisionIds    revision 識別碼的清單，部署會依陣列順序逐一執行
+      environmentId  目標環境識別碼
+      description    選填
+
+    注意 clusterId 不是此 API 的參數，部署對象由 environmentId 決定。
+
+    若目標環境缺少必要屬性，部署會失敗，且回應中會帶回驗證結果，
+    因此失敗時要把完整回應保留下來供判讀。
+    """
+    if not isinstance(revision_ids, (list, tuple)):
+        revision_ids = [revision_ids]
+
     log("")
     log("--- 觸發部署 ---")
+    log("  revisionIds=%s environmentId=%s"
+        % (list(revision_ids), environment_id))
+
     body = {
-        "revisions": [int(revision_id)],
+        "revisionIds": [int(r) for r in revision_ids],
         "environmentId": int(environment_id),
     }
-    if cluster_id:
-        body["clusterId"] = int(cluster_id)
-
-    log("  revision=%s environment=%s cluster=%s"
-        % (revision_id, environment_id, cluster_id or "(未指定)"))
+    if description:
+        body["description"] = description
 
     resp = _request("POST", "/deployments", json=body)
     data = resp.json()
 
+    # 部署失敗時，回應可能是驗證結果而非 deployment 物件
+    if isinstance(data, dict) and "validationResponse" in data:
+        v = (data.get("validationResponse") or {}).get("validation") or {}
+        log("完整回應：%s" % json.dumps(data, ensure_ascii=False)[:2500])
+        missing = v.get("missingVqlPropertiesUseRevisionValues") or []
+        if missing:
+            log("")
+            log("目標環境缺少下列屬性，且其設定為沿用 revision 值：")
+            for name in missing:
+                log("  %s" % name)
+        fail("部署未開始：%s"
+             % (v.get("errorVqlValidation")
+                or v.get("outputVqlValidation")
+                or "目標環境驗證未通過"))
+
     log("完整回應：%s" % json.dumps(data, ensure_ascii=False, indent=2)[:2000])
-    deployment_id = data.get("id")
+
+    deployment_id = data.get("id") if isinstance(data, dict) else data
+    if deployment_id is None:
+        fail("回應中找不到 deployment id：%s"
+             % json.dumps(data, ensure_ascii=False)[:500])
+
     log("deployment id = %s" % deployment_id)
     return deployment_id
 
 
 # ---------------------------------------------------------------- 6. 輪詢進度
 
-# SM 的狀態字串依版本而異，先放寬比對範圍。
-# 第一次實測後，請依實際回傳值收斂這兩組集合。
+# 由實際回應確認：欄位是 state（不是 status），值為 IN_PROGRESS / OK。
+# 失敗時的字串尚未實測，先放寬比對範圍。
 SUCCESS_STATES = {"OK", "SUCCESS", "SUCCESSFUL", "FINISHED", "DONE", "COMPLETED"}
 FAILURE_STATES = {"ERROR", "FAILED", "FAILURE", "KO", "CANCELLED", "CANCELED"}
+RUNNING_STATES = {"IN_PROGRESS", "RUNNING", "PENDING", "QUEUED", "STARTED"}
+
+
+# 核心部署工作。這幾項失敗代表 VQL 沒有正確套用。
+CORE_TASK_TYPES = {"PROMOTION_CONFIG", "VQL_TRANSACTIONAL", "VQL_COMMIT"}
+
+# 輔助工作。失敗不影響過版結果，但仍需提醒查看。
+# 例如 Data Catalog / Data Marketplace 同步失敗時，
+# 物件已正確部署到 VDP，只是目錄服務尚未同步。
+AUXILIARY_TASK_TYPES = {"DATACATALOG_SYNC"}
+
+
+def _summarize_tasks(tasks):
+    """整理各項 task，回傳 (摘要行, 失敗的核心工作, 失敗的輔助工作)。
+
+    tasks 由新到舊排列，依 id 排序後才是執行順序。
+    """
+    lines, core_failed, aux_failed = [], [], []
+
+    for t in sorted(tasks, key=lambda x: x.get("id", 0)):
+        st = str(t.get("state", "")).upper()
+        ttype = str(t.get("deploymentExecutionType", ""))
+        lines.append("  [%s] %s（%s）" % (st, t.get("name", ""), ttype))
+
+        out = (t.get("output") or "").strip()
+        for ln in out.splitlines():
+            if ln.strip():
+                lines.append("      %s" % ln.strip())
+
+        if st in FAILURE_STATES:
+            if ttype in AUXILIARY_TASK_TYPES:
+                aux_failed.append(t)
+            else:
+                core_failed.append(t)
+
+    return lines, core_failed, aux_failed
+
+
+def _log_task_errors(tasks, level):
+    """輸出失敗 task 的錯誤內容。level 為 error 或 warning。"""
+    for t in tasks:
+        err = (t.get("error") or t.get("output") or "").strip()
+        log("##[%s]%s（%s）未成功"
+            % (level, t.get("name"), t.get("deploymentExecutionType")))
+        for ln in err.splitlines():
+            if ln.strip():
+                log("##[%s]    %s" % (level, ln.strip()[:300]))
 
 
 def wait_for_deployment(deployment_id, timeout_sec=900, interval=10):
     """輪詢直到部署結束。
 
-    這是內層輪詢，必須等到部署真正完成，pipeline 這個 run 才結束，
+    這是內層輪詢，必須等到部署真正結束，pipeline 這個 run 才結束，
     呼叫端的外層輪詢才不會過早回報成功。
+
+    兩個由實測確認的重點：
+      1. 不可用 progress 百分比判斷完成。progress 會先到 100，
+         但 state 仍為 IN_PROGRESS（最後的 commit 尚未結束）。
+      2. 成敗以整體 state 為準，而非個別 task。輔助工作
+         （如 Data Catalog 同步）失敗時，整體仍會是 OK，
+         此時過版本身已成功，只需提醒查看。
     """
     log("")
     log("--- 輪詢部署進度 ---")
     deadline = time.time() + timeout_sec
-    last_status = None
+    last_signature = None
 
     while time.time() < deadline:
         resp = _request("GET", "/deployments/%s/progress" % deployment_id)
@@ -688,25 +777,62 @@ def wait_for_deployment(deployment_id, timeout_sec=900, interval=10):
             time.sleep(interval)
             continue
 
-        status = str(progress.get("status", "")).upper()
-        pct = progress.get("percentage", progress.get("progress", "?"))
+        state = str(progress.get("state", "")).upper()
+        pct = progress.get("progress", "?")
+        tasks = progress.get("tasks") or []
+        lines, core_failed, aux_failed = _summarize_tasks(tasks)
 
-        if status != last_status:
-            log("狀態：%s（%s%%）" % (status or "(無 status 欄位)", pct))
-            log("完整回應：%s"
-                % json.dumps(progress, ensure_ascii=False)[:1500])
-            last_status = status
+        signature = (state, tuple(lines))
+        if signature != last_signature:
+            log("")
+            log("整體狀態：%s（%s%%）" % (state or "(無 state 欄位)", pct))
+            for ln in lines:
+                log(ln)
+            last_signature = signature
 
-        if status in SUCCESS_STATES:
+        if state in SUCCESS_STATES:
+            warn_msg = (progress.get("warningMessage") or "").strip()
+
+            if core_failed:
+                # 整體 OK 但核心工作失敗，兩者矛盾，從嚴處理
+                log("")
+                _log_task_errors(core_failed, "error")
+                fail("整體狀態為 %s，但核心部署工作未成功，請確認實際結果。"
+                     "deploymentId=%s" % (state, deployment_id))
+
+            if aux_failed or warn_msg:
+                log("")
+                if warn_msg:
+                    log("##[warning]%s" % warn_msg)
+                _log_task_errors(aux_failed, "warning")
+                names = "、".join(t.get("name", "") for t in aux_failed)
+                note = ("過版已完成，但有附帶工作未成功：%s。"
+                        "請查看訊息並確認是否需要人工處理。" % names
+                        if aux_failed else warn_msg)
+                log("##vso[task.setvariable variable=deployWarning]%s" % note)
+                log("")
+                log("部署完成（含警告）")
+                return progress
+
+            log("")
             log("部署完成")
             return progress
 
-        if status in FAILURE_STATES:
-            fail("部署失敗：%s" % json.dumps(progress, ensure_ascii=False))
+        if state in FAILURE_STATES:
+            log("")
+            _log_task_errors(core_failed + aux_failed, "error")
+            log("完整回應：%s"
+                % json.dumps(progress, ensure_ascii=False)[:2000])
+            fail("部署失敗：state=%s，deploymentId=%s" % (state, deployment_id))
+
+        if state and state not in RUNNING_STATES:
+            log("##[warning]未知的狀態值 %s，視為進行中繼續等待。"
+                "請回報此值以便納入判斷。" % state)
 
         time.sleep(interval)
 
-    fail("部署逾時（%d 秒），請至 Solution Manager 確認實際狀態" % timeout_sec)
+    fail("部署逾時（%d 秒），deploymentId=%s，"
+         "請至 Solution Manager 確認實際狀態" % (timeout_sec, deployment_id))
 
 
 # ---------------------------------------------------------------- 主流程
@@ -881,7 +1007,8 @@ def main():
 
     # 階段 5、6：部署並等待完成
     deployment_id = start_deployment(
-        revision_id, environment_id, cluster_id)
+        [revision_id], environment_id,
+        "" if args.description in placeholder else args.description)
     log("##vso[task.setvariable variable=deploymentId]%s" % deployment_id)
 
     wait_for_deployment(deployment_id, args.timeout, args.interval)

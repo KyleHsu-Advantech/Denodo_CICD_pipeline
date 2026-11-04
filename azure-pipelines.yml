@@ -61,6 +61,14 @@ parameters:
     type: string
     default: '/descVql'
 
+  # 模擬用：填 repo 內存放的 DESC 回傳檔路徑（例如 vql/desc_response.json）。
+  # 指定後不呼叫 APIM，改讀這個檔案，其餘流程完全相同；
+  # components 可維持 -，會由檔內的 requested_name 取得。
+  # DESC API 上線後留 - 即可。
+  - name: descResponseFile
+    type: string
+    default: '-'
+
   # 目標環境，可填名稱或數字 id，腳本會自動解析
   - name: environment
     type: string
@@ -145,6 +153,7 @@ steps:
   - script: |
       echo "stage       = ${{ parameters.stage }}"
       echo "components  = ${{ parameters.components }}"
+      echo "descResponseFile = ${{ parameters.descResponseFile }}"
       echo "environment = ${{ parameters.environment }}"
       echo "clusterId   = ${{ parameters.clusterId }}"
       echo "revisionName = ${{ parameters.revisionName }}"
@@ -165,6 +174,7 @@ steps:
         --stage "${{ parameters.stage }}"
         --components "${{ parameters.components }}"
         --desc-api-path "${{ parameters.descApiPath }}"
+        --desc-response-file "${{ parameters.descResponseFile }}"
         --desc-options "${{ parameters.descOptions }}"
         --database "${{ parameters.database }}"
         ${{ variables.noTransformFlag }}

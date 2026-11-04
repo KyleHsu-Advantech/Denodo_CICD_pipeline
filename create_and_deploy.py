@@ -37,6 +37,7 @@ import time
 
 import requests
 
+from desc_response import DescError, extract_vql
 from vql_transform import transform_vql, format_stats
 
 
@@ -268,7 +269,12 @@ def fetch_vql_from_api(components, api_path, options, database=None,
     DROP ... IF EXISTS ... CASCADE，多份串接時後面的 DROP
     會把前面已建立的物件連帶刪除。
 
-    回應可為純文字 VQL，或 JSON（支援 vql / content / data 等欄位）。
+    回應格式：
+      - descvqlbatch JSON（{name, elements:[...]}）：由 desc_response 完整檢核，
+        包含 status、請求的 view 是否都在、datasource 是否已排除、
+        是否夾帶憑證、statement_count 是否一致。
+      - 舊格式（純文字 VQL，或 JSON 的 vql / content / data / result 欄位）：
+        原樣放行，不做上述檢核。
     """
     log("")
     log("--- 取得完整 VQL（含相依展開）---")
@@ -282,25 +288,15 @@ def fetch_vql_from_api(components, api_path, options, database=None,
     resp = _request("POST", api_path,
                     json={"views": components, "options": options})
 
-    ctype = resp.headers.get("Content-Type", "")
-    if "json" in ctype.lower():
-        data = resp.json()
-        if isinstance(data, dict):
-            vql = (data.get("vql") or data.get("content")
-                   or data.get("data") or data.get("result"))
-            if vql is None:
-                fail("DESC API 回應中找不到 VQL 欄位：%s"
-                     % json.dumps(data, ensure_ascii=False)[:500])
-        elif isinstance(data, list):
-            fail("DESC API 回傳陣列。請改為回傳單一份合併後的 VQL，"
-                 "避免多份 DROP CASCADE 互相刪除")
-        else:
-            vql = str(data)
-    else:
-        vql = resp.text
-
-    if not vql or not vql.strip():
-        fail("DESC API 回傳空的 VQL")
+    try:
+        vql, desc = extract_vql(resp.text, resp.headers.get("Content-Type", ""))
+    except DescError as exc:
+        fail("DESC 回應驗證未通過：%s" % exc)
+    if desc:
+        log("  DESC 檢核通過：%d 個 view、%d 條語句、排除 %d 個 datasource"
+            % (len(desc.requested), desc.statement_count, len(desc.excluded)))
+        for w in desc.warnings:
+            log("##[warning]%s" % w)
 
     raw = vql.encode("utf-8")
     if raw.startswith(b"\xef\xbb\xbf"):
@@ -848,11 +844,12 @@ def main():
     ap.add_argument("--name", default="", help="Revision 名稱")
     ap.add_argument("--description", default="", help="Revision 說明")
     ap.add_argument("--components", default="",
-                    help="要過版的資料表清單，逗號分隔。"
+                    help="要過版的資料表清單，逗號分隔，須帶 database 前綴"
+                         "（如 admin.rv_x,sap.rv_y）。"
                          "指定後會呼叫 DESC API 取得展開相依的完整 VQL")
     ap.add_argument("--database", default="",
-                    help="物件要建立在哪個 database。"
-                         "DESC VQL 不含 CONNECT DATABASE，未指定則會建在預設 db")
+                    help="僅在 DESC 輸出不含 CONNECT DATABASE 時才使用（舊版輸出）。"
+                         "新版 DESC 輸出自帶各 database 的 CONNECT，可留空")
     ap.add_argument("--no-transform", action="store_true",
                     help="不加工 VQL，原樣送出（保留 DROP + CREATE）")
     ap.add_argument("--keep-drop-types", action="store_true",

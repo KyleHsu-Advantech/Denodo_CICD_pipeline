@@ -90,9 +90,11 @@ parameters:
   - name: vqlFile
     type: string
     default: 'vql/deploy.vql'
+  # 只有 VQL 檔頭標記需搭配 properties 檔時才需要（DESC 產出的 VQL 不需要）。
+  # 填 - 表示不使用；填了路徑但檔案不存在會中止。
   - name: propertiesFile
     type: string
-    default: 'vql/deploy.properties'
+    default: '-'
 
   # 小型 VQL 臨時測試用，填了會覆蓋上面的檔案路徑
   - name: vqlContentBase64

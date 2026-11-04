@@ -54,7 +54,7 @@ parameters:
   #           includeEnvSpecificElements、includeNonEnvSpecificElements
   - name: descOptions
     type: string
-    default: ''
+    default: '-'
 
   # APIM 上 DESC API 的路徑，接在 SM 前綴之後
   - name: descApiPath
@@ -113,6 +113,30 @@ variables:
   # apimBaseUrl / apimSubscriptionKey / apimLoginEmail / apimLoginPassword
   - group: denodo-apim-cicd
 
+  # 旗標型參數。條件式（if）不能直接寫在 arguments 這種字串值裡面，
+  # 所以先在這裡依參數產生旗標字串（開啟時為旗標，否則為空字串），
+  # 再於 arguments 以 variables.xxx 的範本運算式帶入。
+  - ${{ if eq(parameters.transformVql, 'false') }}:
+      - name: noTransformFlag
+        value: '--no-transform'
+  - ${{ if ne(parameters.transformVql, 'false') }}:
+      - name: noTransformFlag
+        value: ''
+
+  - ${{ if eq(parameters.keepDropTypes, 'true') }}:
+      - name: keepDropTypesFlag
+        value: '--keep-drop-types'
+  - ${{ if ne(parameters.keepDropTypes, 'true') }}:
+      - name: keepDropTypesFlag
+        value: ''
+
+  - ${{ if eq(parameters.allowRevisionFallback, 'true') }}:
+      - name: allowRevisionFallbackFlag
+        value: '--allow-revision-fallback'
+  - ${{ if ne(parameters.allowRevisionFallback, 'true') }}:
+      - name: allowRevisionFallbackFlag
+        value: ''
+
 name: $(Date:yyyyMMdd)$(Rev:.r)-${{ parameters.stage }}
 
 steps:
@@ -143,10 +167,8 @@ steps:
         --desc-api-path "${{ parameters.descApiPath }}"
         --desc-options "${{ parameters.descOptions }}"
         --database "${{ parameters.database }}"
-        ${{ if eq(parameters.transformVql, 'false') }}:
-          --no-transform
-        ${{ if eq(parameters.keepDropTypes, 'true') }}:
-          --keep-drop-types
+        ${{ variables.noTransformFlag }}
+        ${{ variables.keepDropTypesFlag }}
         --environment "${{ parameters.environment }}"
         --cluster-id "${{ parameters.clusterId }}"
         --name "${{ parameters.revisionName }}"
@@ -155,8 +177,7 @@ steps:
         --properties-file "${{ parameters.propertiesFile }}"
         --vql-base64 "${{ parameters.vqlContentBase64 }}"
         --properties-base64 "${{ parameters.propertiesBase64 }}"
-        ${{ if eq(parameters.allowRevisionFallback, 'true') }}:
-          --allow-revision-fallback
+        ${{ variables.allowRevisionFallbackFlag }}
     env:
       APIM_BASE_URL: $(apimBaseUrl)
       # secret 變數不會自動注入環境，必須在這裡顯式對應

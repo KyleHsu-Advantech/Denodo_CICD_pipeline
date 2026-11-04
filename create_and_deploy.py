@@ -701,7 +701,11 @@ def start_deployment(revision_ids, environment_id, description=""):
 
     log("完整回應：%s" % json.dumps(data, ensure_ascii=False, indent=2)[:2000])
 
-    deployment_id = data.get("id") if isinstance(data, dict) else data
+    # SM 實際回傳 {"deploymentId": N}；保留 id 以相容其他版本
+    if isinstance(data, dict):
+        deployment_id = data.get("deploymentId") or data.get("id")
+    else:
+        deployment_id = data
     if deployment_id is None:
         fail("回應中找不到 deployment id：%s"
              % json.dumps(data, ensure_ascii=False)[:500])

@@ -16,17 +16,20 @@ parameters:
       - validate
       - deploy
 
-  # 要過版的資料表清單，逗號分隔。
+  # 要過版的 view 清單，逗號分隔，須帶 database 前綴，
+  # 例如 admin.rv_scheduler_job_result,sap.rv_aclmes_asplus_warr_expiring
   # 指定後會呼叫 APIM 上的 DESC API 取得展開相依後的完整 VQL。
+  # 填 - 時改讀 vqlFile。
   - name: components
     type: string
     default: '-'
 
-  # 物件要建立在哪個 database。DESC VQL 不含 CONNECT DATABASE，
-  # 未指定時物件會被建到目標端的預設 database。
+  # 已不需要。新版 DESC 輸出自帶各 database 的 CONNECT DATABASE。
+  # 僅在 DESC 輸出不含 CONNECT DATABASE（舊版輸出）時，
+  # 才會用這個值補上；一律留 - 即可。
   - name: database
     type: string
-    default: admin
+    default: '-'
 
   # VQL 加工（保險機制）。DESC 選項正確時輸出本來就不含 DROP，
   # 此加工會偵測到無事可做而不變更內容；僅在選項未生效時才補救。

@@ -37,7 +37,8 @@ import time
 
 import requests
 
-from desc_response import DescError, extract_vql
+from desc_response import (DescError, extract_vql, load_response_file,
+                           requested_names)
 from vql_transform import transform_vql, format_stats
 
 
@@ -261,7 +262,8 @@ def _request(method, path, allow_404=False, **kwargs):
 # ------------------------------------------------- 1. 由 DESC API 取得 VQL
 
 def fetch_vql_from_api(components, api_path, options, database=None,
-                       transform=True, keep_drop_types=False):
+                       transform=True, keep_drop_types=False,
+                       response_file=None):
     """呼叫 APIM 上的 DESC API，取回展開相依後的完整 VQL。
 
     一次送出全部 component，由 API 端合併去重後回傳單一份 VQL。
@@ -275,6 +277,10 @@ def fetch_vql_from_api(components, api_path, options, database=None,
         是否夾帶憑證、statement_count 是否一致。
       - 舊格式（純文字 VQL，或 JSON 的 vql / content / data / result 欄位）：
         原樣放行，不做上述檢核。
+
+    response_file 有值時，不呼叫 APIM，改讀 repo 內存放的回傳檔，
+    其餘流程（檢核、加工、建立 revision、驗證、部署）完全相同。
+    用於 DESC API 尚未上線時，以真實回傳內容模擬整條流程。
     """
     log("")
     log("--- 取得完整 VQL（含相依展開）---")
@@ -285,11 +291,19 @@ def fetch_vql_from_api(components, api_path, options, database=None,
     log("  對應語句：%s"
         % build_desc_statement(components, options)[:300])
 
-    resp = _request("POST", api_path,
-                    json={"views": components, "options": options})
+    if response_file:
+        log("##[warning]模擬模式：讀取回傳檔 %s，未呼叫 APIM 的 DESC API"
+            % response_file)
+        if not os.path.isfile(response_file):
+            fail("找不到 DESC 回傳檔：%s" % response_file)
+        body, ctype = load_response_file(response_file), "application/json"
+    else:
+        resp = _request("POST", api_path,
+                        json={"views": components, "options": options})
+        body, ctype = resp.text, resp.headers.get("Content-Type", "")
 
     try:
-        vql, desc = extract_vql(resp.text, resp.headers.get("Content-Type", ""))
+        vql, desc = extract_vql(body, ctype)
     except DescError as exc:
         fail("DESC 回應驗證未通過：%s" % exc)
     if desc:
@@ -297,6 +311,12 @@ def fetch_vql_from_api(components, api_path, options, database=None,
             % (len(desc.requested), desc.statement_count, len(desc.excluded)))
         for w in desc.warnings:
             log("##[warning]%s" % w)
+        # 回傳的 view 必須就是請求的那些，否則代表 API 處理的不是我們要過版的內容
+        want = {c.lower() for c in components}
+        got = {n.lower() for n in desc.requested}
+        if want != got:
+            fail("DESC 回傳的 view 與請求不一致。請求：%s；回傳：%s"
+                 % (", ".join(sorted(want)), ", ".join(sorted(got))))
 
     raw = vql.encode("utf-8")
     if raw.startswith(b"\xef\xbb\xbf"):
@@ -860,6 +880,10 @@ def main():
                          "留空則使用預設值（見 DEFAULT_DESC_OPTIONS）")
     ap.add_argument("--desc-api-path", default="/descVql",
                     help="APIM 上 DESC API 的路徑（接在 SM 前綴之後）")
+    ap.add_argument("--desc-response-file", default="",
+                    help="模擬用：repo 內存放的 DESC 回傳檔（JSON）。指定後不呼叫 "
+                         "APIM，改讀此檔，其餘流程相同。--components 可省略，"
+                         "會由檔內的 requested_name 取得")
     ap.add_argument("--vql-file", default="",
                     help="repo 內的 VQL 檔路徑，腳本自行讀檔並轉 base64（建議）")
     ap.add_argument("--properties-file", default="",
@@ -938,13 +962,24 @@ def main():
     components = [c.strip() for c in args.components.split(",")
                   if c.strip() and c.strip() != "-"]
 
+    desc_file = (None if args.desc_response_file in placeholder
+                 else args.desc_response_file)
+    if desc_file and not components:
+        if not os.path.isfile(desc_file):
+            fail("找不到 DESC 回傳檔：%s" % desc_file)
+        components = requested_names(load_response_file(desc_file))
+        if not components:
+            fail("回傳檔中找不到 requested_name：%s" % desc_file)
+        log("由回傳檔取得 view 清單：%s" % ", ".join(components))
+
     if components:
         desc_options = parse_desc_options(args.desc_options)
         vql_b64 = fetch_vql_from_api(
             components, args.desc_api_path, desc_options,
             database=None if args.database in placeholder else args.database,
             transform=not args.no_transform,
-            keep_drop_types=args.keep_drop_types)
+            keep_drop_types=args.keep_drop_types,
+            response_file=desc_file)
     elif args.vql_file not in placeholder:
         log("")
         log("--- 讀取 VQL 檔案 ---")

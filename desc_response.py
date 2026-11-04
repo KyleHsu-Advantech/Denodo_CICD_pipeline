@@ -133,6 +133,23 @@ def parse_desc_response(payload, dev_marker="ACLDTPLTFRM-DEV", strict_count=True
     return DescResult(vql, requested, excluded, actual, warnings)
 
 
+def load_response_file(path):
+    """Read a saved DESC response (UTF-8, BOM tolerated)."""
+    with open(path, "rb") as f:
+        return f.read().decode("utf-8-sig")
+
+
+def requested_names(body_text):
+    """requested_name of every element in a descvqlbatch response ([] if not that format)."""
+    try:
+        data = json.loads(body_text)
+    except ValueError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    return [e["requested_name"] for e in data.get("elements") or [] if e.get("requested_name")]
+
+
 def extract_vql(body_text, content_type="", dev_marker="ACLDTPLTFRM-DEV", strict_count=True):
     """Single entry point for create_and_deploy.fetch_vql_from_api.
 

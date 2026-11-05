@@ -115,6 +115,13 @@ parameters:
       - 'false'
       - 'true'
 
+  # 逗號分隔。屬性名稱含其中任一字串者，允許回退使用來源端（DEV）的值，
+  # 其餘仍視為錯誤。用於第一次上線的新 datasource（填其名稱，例如 ds_twse）。
+  # 比 allowRevisionFallback 安全：只放行指定的，不是全部。
+  - name: allowFallbackFor
+    type: string
+    default: '-'
+
 pool:
   vmImage: ubuntu-latest
 
@@ -189,6 +196,7 @@ steps:
         --properties-file "${{ parameters.propertiesFile }}"
         --vql-base64 "${{ parameters.vqlContentBase64 }}"
         --properties-base64 "${{ parameters.propertiesBase64 }}"
+        --allow-fallback-for "${{ parameters.allowFallbackFor }}"
         ${{ variables.allowRevisionFallbackFlag }}
     env:
       APIM_BASE_URL: $(apimBaseUrl)

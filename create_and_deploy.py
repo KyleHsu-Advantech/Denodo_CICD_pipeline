@@ -274,7 +274,7 @@ def _request(method, path, allow_404=False, **kwargs):
 
 def fetch_vql_from_api(components, api_path, options, database=None,
                        transform=True, keep_drop_types=False,
-                       response_file=None):
+                       response_file=None, create_datasources=None):
     """呼叫 APIM 上的 DESC API，取回展開相依後的完整 VQL。
 
     一次送出全部 component，由 API 端合併去重後回傳單一份 VQL。
@@ -314,13 +314,15 @@ def fetch_vql_from_api(components, api_path, options, database=None,
         body, ctype = resp.text, resp.headers.get("Content-Type", "")
 
     try:
-        vql, desc = extract_vql(body, ctype)
+        vql, desc = extract_vql(body, ctype, create_datasources=create_datasources)
     except DescError as exc:
         fail("DESC 回應驗證未通過：%s" % exc)
     if desc:
-        log("  DESC 檢核通過：%d 個 view、%d 條語句、帶出 %d 個 datasource、排除 %d 個"
-            % (len(desc.requested), desc.statement_count,
-               len(desc.datasources), len(desc.excluded)))
+        log("  DESC 檢核通過：%d 個 view、%d 條語句；datasource：DESC 帶出 %d 個、"
+            "保留建立 %d 個、剔除 %d 個（交由目標環境既有的）、DESC 端排除 %d 個"
+            % (len(desc.requested), desc.statement_count, len(desc.datasources),
+               len(desc.datasources) - len(desc.stripped_datasources),
+               len(desc.stripped_datasources), len(desc.excluded)))
         for w in desc.warnings:
             log("##[warning]%s" % w)
         # 回傳的 view 必須就是請求的那些，否則代表 API 處理的不是我們要過版的內容
@@ -960,6 +962,10 @@ def main():
                     help="目標環境，可填名稱（如 ACLDTPLTFRM-PRD）或數字 id")
     ap.add_argument("--cluster-id", default="",
                     help="選填。留空則由目標環境的 server 清單自動推導")
+    ap.add_argument("--create-datasources", default="*",
+                    help="哪些 datasource 由 VQL 建立／覆蓋。* = DESC 帶出的全部放行（預設），"
+                         "PRD 的值交給 SM 的環境屬性機制；- = 全部從 VQL 剔除，PRD 既有的完全不動；"
+                         "或逗號分隔的 db.ds / ds 清單，只放行列出的，其餘剔除")
     ap.add_argument("--allow-fallback-for", default="",
                     help="逗號分隔。屬性名稱含其中任一字串者，允許回退使用來源端（DEV）的值，"
                          "其餘仍視為錯誤。用於第一次上線的新 datasource（填其名稱）")
@@ -1045,7 +1051,9 @@ def main():
             database=None if args.database in placeholder else args.database,
             transform=not args.no_transform,
             keep_drop_types=args.keep_drop_types,
-            response_file=desc_file)
+            response_file=desc_file,
+            create_datasources=[p.strip() for p in args.create_datasources.split(",")
+                                if p.strip() and p.strip() != "-"])
     elif args.vql_file not in placeholder:
         log("")
         log("--- 讀取 VQL 檔案 ---")

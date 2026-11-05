@@ -76,12 +76,23 @@ _token = None
 
 # ---------------------------------------------------------------- 工具
 
+# VQL 的 datasource 敘述帶有加密後的密碼。任何輸出（含 SM 回傳的錯誤內容）
+# 都先遮罩 PASSWORD / USERPASSWORD 後面的字串，避免寫進 pipeline log。
+# 只比對大寫關鍵字，欄位名稱如 "Password" 不受影響；
+# 結尾允許 $，涵蓋輸出被截斷、引號沒有收尾的情況。
+_SECRET_LOG_RE = re.compile(r"(\b(?:USER)?PASSWORD\b\s*=?\s*)'[^']*(?:'|$)")
+
+
+def _mask_secrets(text):
+    return _SECRET_LOG_RE.sub(lambda m: m.group(1) + "'***'", str(text))
+
+
 def log(msg):
-    print(msg, flush=True)
+    print(_mask_secrets(msg), flush=True)
 
 
 def fail(msg):
-    print("##[error]%s" % msg, flush=True)
+    print("##[error]%s" % _mask_secrets(msg), flush=True)
     sys.exit(1)
 
 
@@ -307,8 +318,9 @@ def fetch_vql_from_api(components, api_path, options, database=None,
     except DescError as exc:
         fail("DESC 回應驗證未通過：%s" % exc)
     if desc:
-        log("  DESC 檢核通過：%d 個 view、%d 條語句、排除 %d 個 datasource"
-            % (len(desc.requested), desc.statement_count, len(desc.excluded)))
+        log("  DESC 檢核通過：%d 個 view、%d 條語句、帶出 %d 個 datasource、排除 %d 個"
+            % (len(desc.requested), desc.statement_count,
+               len(desc.datasources), len(desc.excluded)))
         for w in desc.warnings:
             log("##[warning]%s" % w)
         # 回傳的 view 必須就是請求的那些，否則代表 API 處理的不是我們要過版的內容
@@ -545,8 +557,14 @@ def create_revision(name, description, vql_b64, properties_b64=None):
 
 # ---------------------------------------------------------------- 4. 驗證
 
+def _fallback_allowed(name, patterns):
+    """屬性名稱含任一指定字串（不分大小寫）即視為可放行。"""
+    n = str(name).lower()
+    return any(p in n for p in patterns)
+
+
 def validate_revision(revision_id, environment_id, description,
-                      allow_revision_fallback=False):
+                      allow_revision_fallback=False, allow_fallback_for=None):
     """驗證 revision 是否可安全部署到目標環境。
 
     SM 即使驗證失敗也可能回 HTTP 200，因此必須檢查回應內容，
@@ -600,19 +618,33 @@ def validate_revision(revision_id, environment_id, description,
                            or v.get("outputSchValidation") or sch_result))
 
     # 2) 會回退使用來源端（DEV）值的屬性 —— 預設視為錯誤
+    #    例外：屬性名稱含 allow_fallback_for 任一字串者（例如新 datasource 的名稱）放行，
+    #    其餘仍視為錯誤。allow_revision_fallback 則是全部放行。
     use_rev = v.get("missingVqlPropertiesUseRevisionValues") or []
+    patterns = [p.strip().lower() for p in (allow_fallback_for or []) if p.strip()]
+    allowed_fb = []
     if use_rev:
         log("")
         log("以下屬性在目標環境與伺服器皆無值，將回退使用來源端的值：")
         for name in use_rev:
             log("  %s" % name)
-        msg = ("有 %d 項屬性會沿用開發環境的值（%s%s）"
-               % (len(use_rev), ", ".join(str(n) for n in use_rev[:3]),
-                  " 等" if len(use_rev) > 3 else ""))
+
+        def _summary(names):
+            return ("有 %d 項屬性會沿用開發環境的值（%s%s）"
+                    % (len(names), ", ".join(str(n) for n in names[:3]),
+                       " 等" if len(names) > 3 else ""))
+
         if allow_revision_fallback:
-            log("##[warning]%s，已依設定放行" % msg)
+            log("##[warning]%s，已依設定放行" % _summary(use_rev))
         else:
-            problems.append(msg)
+            allowed_fb = [n for n in use_rev if _fallback_allowed(n, patterns)]
+            blocked = [n for n in use_rev if n not in allowed_fb]
+            if allowed_fb:
+                log("##[warning]%s，已依 allowFallbackFor 放行" % _summary(allowed_fb))
+            if blocked:
+                problems.append(
+                    _summary(blocked)
+                    + "。請在 SM 的 PRD 環境設定這些屬性，或以 allowFallbackFor 指定放行")
 
     # 3) 改用目標伺服器現有值的屬性 —— 警告但放行
     with_server = v.get("missingVqlPropertiesWithServerValues") or {}
@@ -639,6 +671,7 @@ def validate_revision(revision_id, environment_id, description,
         "vqlValidation": vql_result,
         "schedulerValidation": sch_result,
         "useRevisionValues": list(use_rev),
+        "allowedFallback": list(allowed_fb),
         "withServerValues": list(with_server),
         "message": v.get("messageResult", ""),
     }
@@ -758,15 +791,40 @@ def _summarize_tasks(tasks):
     return lines, core_failed, aux_failed
 
 
+def _error_digest(text, max_lines=40):
+    """把冗長的 SM 錯誤輸出濃縮成重點。
+
+    VQL 部署失敗時，輸出會夾帶整段失敗的語句（動輒數百行）。
+    只保留 Command / Statement 的第一行與 ERROR 行；若一行都沒有，
+    退回顯示前幾行。完整內容仍在「完整回應」那行 log 裡。
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    keep = [ln for ln in lines
+            if re.match(r"(ERROR|Command|Statement:)", ln, re.IGNORECASE)]
+    if not keep:
+        keep = lines[:max_lines]
+    return [ln[:200] for ln in keep[:max_lines]]
+
+
 def _log_task_errors(tasks, level):
     """輸出失敗 task 的錯誤內容。level 為 error 或 warning。"""
     for t in tasks:
         err = (t.get("error") or t.get("output") or "").strip()
         log("##[%s]%s（%s）未成功"
             % (level, t.get("name"), t.get("deploymentExecutionType")))
-        for ln in err.splitlines():
-            if ln.strip():
-                log("##[%s]    %s" % (level, ln.strip()[:300]))
+        for ln in _error_digest(err):
+            log("##[%s]    %s" % (level, ln))
+
+
+def _warn_if_rollback_disabled(tasks):
+    """VQL 部署失敗時，若環境停用 rollback，已執行的指令可能已生效。"""
+    for t in tasks:
+        if (t.get("deploymentExecutionType") == "VQL_ROLLBACK"
+                and str(t.get("state", "")).upper() == "SKIPPED"
+                and "disabled" in str(t.get("output", "")).lower()):
+            log("##[warning]目標環境的部署設定停用了 rollback，失敗之前已成功執行的"
+                "指令不會被自動還原，請直接檢查目標環境的實際狀態。")
+            return
 
 
 def wait_for_deployment(deployment_id, timeout_sec=900, interval=10):
@@ -841,6 +899,7 @@ def wait_for_deployment(deployment_id, timeout_sec=900, interval=10):
         if state in FAILURE_STATES:
             log("")
             _log_task_errors(core_failed + aux_failed, "error")
+            _warn_if_rollback_disabled(tasks)
             log("完整回應：%s"
                 % json.dumps(progress, ensure_ascii=False)[:2000])
             fail("部署失敗：state=%s，deploymentId=%s" % (state, deployment_id))
@@ -901,6 +960,9 @@ def main():
                     help="目標環境，可填名稱（如 ACLDTPLTFRM-PRD）或數字 id")
     ap.add_argument("--cluster-id", default="",
                     help="選填。留空則由目標環境的 server 清單自動推導")
+    ap.add_argument("--allow-fallback-for", default="",
+                    help="逗號分隔。屬性名稱含其中任一字串者，允許回退使用來源端（DEV）的值，"
+                         "其餘仍視為錯誤。用於第一次上線的新 datasource（填其名稱）")
     ap.add_argument("--allow-revision-fallback", action="store_true",
                     help="允許屬性回退使用來源端（DEV）的值。"
                          "預設視為錯誤並中止，僅在明確確認後才開啟")
@@ -1024,7 +1086,9 @@ def main():
     ok, summary, detail = validate_revision(
         revision_id, environment_id,
         "" if args.description in placeholder else args.description,
-        allow_revision_fallback=args.allow_revision_fallback)
+        allow_revision_fallback=args.allow_revision_fallback,
+        allow_fallback_for=[p for p in args.allow_fallback_for.split(",")
+                            if p.strip() and p.strip() != "-"])
 
     # 輸出結構化結果，供呼叫端（bot）取用並呈現給使用者
     log("##vso[task.setvariable variable=validationState]%s"

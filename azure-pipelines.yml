@@ -115,6 +115,14 @@ parameters:
       - 'false'
       - 'true'
 
+  # 哪些 datasource 由這次部署的 VQL 建立／覆蓋。
+  #   *（預設）  DESC 帶出的 datasource 全部放行，PRD 的值由 SM 的環境屬性機制決定
+  #   -          全部從 VQL 剔除，PRD 上既有的完全不動（保守模式）
+  #   db.ds,...  只放行列出的（例如 poc.ds_twse），其餘剔除
+  - name: createDatasources
+    type: string
+    default: '*'
+
   # 逗號分隔。屬性名稱含其中任一字串者，允許回退使用來源端（DEV）的值，
   # 其餘仍視為錯誤。用於第一次上線的新 datasource（填其名稱，例如 ds_twse）。
   # 比 allowRevisionFallback 安全：只放行指定的，不是全部。
@@ -196,6 +204,7 @@ steps:
         --properties-file "${{ parameters.propertiesFile }}"
         --vql-base64 "${{ parameters.vqlContentBase64 }}"
         --properties-base64 "${{ parameters.propertiesBase64 }}"
+        --create-datasources "${{ parameters.createDatasources }}"
         --allow-fallback-for "${{ parameters.allowFallbackFor }}"
         ${{ variables.allowRevisionFallbackFlag }}
     env:

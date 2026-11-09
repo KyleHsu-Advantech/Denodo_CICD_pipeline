@@ -5,7 +5,7 @@ Pipeline position:  DESC API  ->  desc_response.py  ->  vql_transform.py  ->  SM
 
 Usage:
     python desc_response.py desc.json --out merged.vql [--dev-marker ACLDTPLTFRM-DEV]
-                            [--datasources allow|forbid]
+                            [--datasources allow|forbid] [--create-datasources '*'|'-'|db.ds,...]
 
 Exit code 0 = VQL written (warnings may be printed), 1 = validation failed.
 Output lines use the Azure DevOps ##[warning] / ##[error] prefixes.
@@ -25,6 +25,7 @@ DB_BLOCK_RE = re.compile(r"^CONNECT DATABASE (\w+);[ \t]*$(.*?)^CLOSE;[ \t]*$", 
 OBJ_RE = re.compile(r'^CREATE OR REPLACE (?:VIEW|TABLE) "?([\w$]+)"?', re.M)
 DS_START_RE = re.compile(r"^CREATE (?:OR REPLACE )?DATASOURCE\s+\S+\s+\"?([\w$]+)\"?")
 STMT_START_RE = re.compile(r"^(?:CREATE|ALTER|CONNECT|CLOSE|DROP)\b|^#")
+CONNECT_RE = re.compile(r"^CONNECT DATABASE (\w+);")
 # Credentials may appear only inside DATASOURCE statements, and only encrypted
 # (case-sensitive: column names such as "Password" are fine).
 SECRET_RE = re.compile(r"\bENCRYPTED\b|\b(?:USER)?PASSWORD\b\s*=?\s*'")
@@ -42,7 +43,8 @@ class DescResult:
     excluded: list = field(default_factory=list)
     statement_count: int = 0
     warnings: list = field(default_factory=list)
-    datasources: list = field(default_factory=list)   # datasources recreated by this VQL
+    datasources: list = field(default_factory=list)           # every datasource DESC brought out
+    stripped_datasources: list = field(default_factory=list)  # removed from the VQL (PRD keeps its own)
 
 
 def _split_names(value):
@@ -75,10 +77,46 @@ def _split_datasources(vql):
     return "".join(rest), [(n, "".join(ls)) for n, ls in blocks]
 
 
+def _strip_datasources(vql, keep):
+    """Remove DATASOURCE statements for which keep(db, name) is False.
+
+    Returns (new_vql, kept_names, stripped_names); names are 'db.ds'.
+    """
+    out, kept, stripped = [], [], []
+    db, skipping = None, False
+    for line in vql.splitlines(keepends=True):
+        c = CONNECT_RE.match(line)
+        if c:
+            db = c.group(1)
+        m = DS_START_RE.match(line)
+        if m:
+            full = "%s.%s" % (db, m.group(1)) if db else m.group(1)
+            if keep(db, m.group(1)):
+                kept.append(full)
+                skipping = False
+            else:
+                stripped.append(full)
+                skipping = True
+                continue
+        elif skipping:
+            if STMT_START_RE.match(line):
+                skipping = False
+            else:
+                continue
+        out.append(line)
+    return "".join(out), kept, stripped
+
+
 def parse_desc_response(payload, dev_marker="ACLDTPLTFRM-DEV", strict_count=True,
-                        datasources="allow"):
+                        datasources="allow", create_datasources=None):
     """datasources='allow': the VQL may recreate datasources (SM then applies PRD property
-    values where defined). datasources='forbid': any DATASOURCE statement is rejected."""
+    values where defined). datasources='forbid': any DATASOURCE statement is rejected.
+
+    create_datasources (list or None) decides which datasources stay in the VQL:
+      None / ['*']   all stay (SM environment properties decide the PRD values)
+      []             all removed (PRD keeps whatever it already has)
+      ['db.ds', ...] only the listed ones stay ('ds' alone also matches); the rest are removed
+    """
     if not isinstance(payload, dict) or payload.get("name") != "descvqlbatch":
         raise DescError("unexpected payload: top-level name is not 'descvqlbatch'")
     elements = payload.get("elements")
@@ -125,12 +163,45 @@ def parse_desc_response(payload, dev_marker="ACLDTPLTFRM-DEV", strict_count=True
     for name, block in ds_blocks:
         if PLAINTEXT_PW_RE.search(block):
             raise DescError(f"datasource {name} carries a plaintext password (expected ENCRYPTED)")
-    if ds_included:
+
+    # 5. credentials are tolerated only inside datasource statements
+    if SECRET_RE.search(rest):
+        raise DescError("VQL contains credential material outside datasource statements (PASSWORD/ENCRYPTED)")
+
+    # 6. statement_count consistency (counted on the VQL as DESC delivered it)
+    actual = len(STMT_RE.findall(vql))
+    declared = merged.get("statement_count")
+    if declared is not None and declared != actual:
+        msg = f"statement_count mismatch: declared {declared}, counted {actual}"
+        if strict_count:
+            raise DescError(msg)
+        warnings.append(msg)
+
+    # 7. decide which datasources stay in the VQL
+    out_vql, kept, stripped = vql, [f"?.{n}" for n in ds_included], []
+    if create_datasources is not None and ds_blocks:
+        wanted = {a.strip().lower() for a in create_datasources if a and a.strip()}
+        allow_all = "*" in wanted
+
+        def keep(db, name):
+            if allow_all:
+                return True
+            n = name.lower()
+            return n in wanted or bool(db and f"{db}.{n}".lower() in wanted)
+
+        out_vql, kept, stripped = _strip_datasources(vql, keep)
+    if kept:
         warnings.append(
-            f"VQL recreates {len(ds_included)} datasource(s) from DEV: {', '.join(ds_included)}. "
-            "SM applies PRD property values where defined; a datasource that is new to PRD falls "
-            "back to DEV values (validation fails unless allowed via allowFallbackFor)"
+            f"VQL recreates {len(kept)} datasource(s) from DEV: {', '.join(kept)}. "
+            "SM applies PRD property values only where the PRD environment defines them "
+            "explicitly (not 'Use revision source value'); otherwise the DEV value is deployed"
         )
+    if stripped:
+        warnings.append(
+            f"{len(stripped)} datasource(s) removed from the VQL, PRD must already have them: "
+            f"{', '.join(stripped)}"
+        )
+
     # every datasource a wrapper refers to must be included here or already exist in PRD
     wrapper_ds = {n.lower() for n in re.findall(r"DATASOURCENAME\s*=\s*\"?([\w$]+)", vql)}
     covered = {n.lower() for n in ds_included} | {n.split(".")[-1].lower() for n in excluded}
@@ -141,26 +212,13 @@ def parse_desc_response(payload, dev_marker="ACLDTPLTFRM-DEV", strict_count=True
             f"(must already exist in PRD): {', '.join(unlisted)}"
         )
 
-    # 5. credentials are tolerated only inside datasource statements
-    if SECRET_RE.search(rest):
-        raise DescError("VQL contains credential material outside datasource statements (PASSWORD/ENCRYPTED)")
-
-    # 6. statement_count consistency
-    actual = len(STMT_RE.findall(vql))
-    declared = merged.get("statement_count")
-    if declared is not None and declared != actual:
-        msg = f"statement_count mismatch: declared {declared}, counted {actual}"
-        if strict_count:
-            raise DescError(msg)
-        warnings.append(msg)
-
-    # 7. warnings only: things the SM promotion step or a human should know about
+    # 8. warnings only: things the SM promotion step or a human should know about
     dbs = list(dict.fromkeys(m.group(1) for m in DB_BLOCK_RE.finditer(vql)))
     if dbs:
         warnings.append("VQL will CONNECT to database(s) that must already exist in the "
                         "target environment: " + ", ".join(dbs))
     if dev_marker:
-        lines = [i for i, l in enumerate(vql.splitlines(), 1) if dev_marker in l]
+        lines = [i for i, l in enumerate(out_vql.splitlines(), 1) if dev_marker in l]
         if lines:
             warnings.append(
                 f"{len(lines)} line(s) contain '{dev_marker}' (line {', '.join(map(str, lines[:5]))}"
@@ -169,7 +227,7 @@ def parse_desc_response(payload, dev_marker="ACLDTPLTFRM-DEV", strict_count=True
     if re.search(r"^CREATE OR REPLACE MAP i18n\b", vql, re.M):
         warnings.append("VQL overwrites server-level i18n map; confirm PRD has the same definition")
 
-    return DescResult(vql, requested, excluded, actual, warnings, ds_included)
+    return DescResult(out_vql, requested, excluded, actual, warnings, ds_included, stripped)
 
 
 def load_response_file(path):
@@ -190,7 +248,7 @@ def requested_names(body_text):
 
 
 def extract_vql(body_text, content_type="", dev_marker="ACLDTPLTFRM-DEV", strict_count=True,
-                datasources="allow"):
+                datasources="allow", create_datasources=None):
     """Single entry point for create_and_deploy.fetch_vql_from_api.
 
     Returns (vql_text, DescResult | None). DescResult is only set for the
@@ -213,7 +271,7 @@ def extract_vql(body_text, content_type="", dev_marker="ACLDTPLTFRM-DEV", strict
         return body_text, None  # plain VQL that happens to start with '{' / '['
 
     if isinstance(data, dict) and data.get("name") == "descvqlbatch":
-        res = parse_desc_response(data, dev_marker, strict_count, datasources)
+        res = parse_desc_response(data, dev_marker, strict_count, datasources, create_datasources)
         return res.vql, res
     if isinstance(data, list):
         raise DescError("DESC API returned an array; expected one merged VQL "
@@ -234,13 +292,17 @@ def main(argv=None):
     ap.add_argument("--lenient-count", action="store_true", help="statement_count mismatch = warning")
     ap.add_argument("--datasources", choices=("allow", "forbid"), default="allow",
                     help="allow: VQL may recreate datasources; forbid: reject any DATASOURCE statement")
+    ap.add_argument("--create-datasources", default="*",
+                    help="* = keep all datasources (default); - = remove all; or db.ds,... = keep only those")
     args = ap.parse_args(argv)
+
+    create = [p.strip() for p in args.create_datasources.split(",") if p.strip() and p.strip() != "-"]
 
     with open(args.input, encoding="utf-8") as f:
         payload = json.load(f)
     try:
         res = parse_desc_response(payload, args.dev_marker, strict_count=not args.lenient_count,
-                                  datasources=args.datasources)
+                                  datasources=args.datasources, create_datasources=create)
     except DescError as e:
         print(f"##[error]DESC validation failed: {e}")
         return 1
@@ -248,7 +310,8 @@ def main(argv=None):
     with open(args.out, "w", encoding="utf-8", newline="") as f:  # UTF-8, keep \n as-is
         f.write(res.vql)
     print(f"DESC OK: {len(res.requested)} view(s), {res.statement_count} statements, "
-          f"{len(res.datasources)} datasource(s) included, {len(res.excluded)} excluded -> {args.out}")
+          f"{len(res.datasources)} datasource(s) from DESC ({len(res.stripped_datasources)} removed), "
+          f"{len(res.excluded)} excluded -> {args.out}")
     for w in res.warnings:
         print(f"##[warning]{w}")
     return 0

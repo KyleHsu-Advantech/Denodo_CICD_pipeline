@@ -29,7 +29,11 @@ CONNECT_RE = re.compile(r"^CONNECT DATABASE (\w+);")
 # Credentials may appear only inside DATASOURCE statements, and only encrypted
 # (case-sensitive: column names such as "Password" are fine).
 SECRET_RE = re.compile(r"\bENCRYPTED\b|\b(?:USER)?PASSWORD\b\s*=?\s*'")
-PLAINTEXT_PW_RE = re.compile(r"\b(?:USER)?PASSWORD\b\s*=?\s*'[^']*'(?!\s*ENCRYPTED\b)")
+# One PASSWORD literal: group 1 = the quoted value, group 2 = an ENCRYPTED flag right after it.
+PASSWORD_LITERAL_RE = re.compile(r"\b(?:USER)?PASSWORD\b\s*=?\s*'([^']*)'(\s*ENCRYPTED\b)?")
+# Parameterized VQL (DESC VQL ... 'includeProperties' = 'yes') uses ${variable} placeholders.
+PLACEHOLDER_RE = re.compile(r"\$\{([^}]+)\}")
+REQUIRES_PROPS_RE = re.compile(r"^#\s*REQUIRES-PROPERTIES-FILE\b", re.M)
 
 
 class DescError(ValueError):
@@ -45,6 +49,9 @@ class DescResult:
     warnings: list = field(default_factory=list)
     datasources: list = field(default_factory=list)           # every datasource DESC brought out
     stripped_datasources: list = field(default_factory=list)  # removed from the VQL (PRD keeps its own)
+    properties: str = None        # properties file text that goes with a parameterized VQL
+    parameterized: bool = False   # VQL uses ${variables} and needs a properties file
+    variables: list = field(default_factory=list)             # ${variables} left in the final VQL
 
 
 def _split_names(value):
@@ -75,6 +82,41 @@ def _split_datasources(vql):
         cur = None
         rest.append(line)
     return "".join(rest), [(n, "".join(ls)) for n, ls in blocks]
+
+
+def _has_plaintext_password(block):
+    """True if a PASSWORD literal is neither a ${placeholder} nor flagged ENCRYPTED."""
+    for m in PASSWORD_LITERAL_RE.finditer(block):
+        value, encrypted = m.group(1), m.group(2)
+        if PLACEHOLDER_RE.fullmatch(value) or encrypted:
+            continue
+        return True
+    return False
+
+
+def parse_properties(text):
+    """key=value lines of a properties file -> dict (comments and blank lines ignored)."""
+    props = {}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line[0] in "#!":
+            continue
+        key, sep, value = line.partition("=")
+        if sep:
+            props[key.strip()] = value.strip()
+    return props
+
+
+def _filter_properties(text, used_keys):
+    """Keep comments/blank lines and only the properties the final VQL still references."""
+    out = []
+    for raw in text.splitlines(keepends=True):
+        line = raw.strip()
+        if not line or line[0] in "#!" or "=" not in line:
+            out.append(raw)
+        elif line.partition("=")[0].strip() in used_keys:
+            out.append(raw)
+    return "".join(out)
 
 
 def _strip_datasources(vql, keep):
@@ -161,7 +203,7 @@ def parse_desc_response(payload, dev_marker="ACLDTPLTFRM-DEV", strict_count=True
     if ds_blocks and datasources == "forbid":
         raise DescError(f"VQL contains datasource statements (PRD owns them): {', '.join(ds_included)}")
     for name, block in ds_blocks:
-        if PLAINTEXT_PW_RE.search(block):
+        if _has_plaintext_password(block):
             raise DescError(f"datasource {name} carries a plaintext password (expected ENCRYPTED)")
 
     # 5. credentials are tolerated only inside datasource statements
@@ -190,11 +232,18 @@ def parse_desc_response(payload, dev_marker="ACLDTPLTFRM-DEV", strict_count=True
             return n in wanted or bool(db and f"{db}.{n}".lower() in wanted)
 
         out_vql, kept, stripped = _strip_datasources(vql, keep)
-    if kept:
+    variables = sorted(set(PLACEHOLDER_RE.findall(out_vql)))
+    parameterized = bool(REQUIRES_PROPS_RE.search(vql)) or bool(variables)
+    if kept and parameterized:
         warnings.append(
-            f"VQL recreates {len(kept)} datasource(s) from DEV: {', '.join(kept)}. "
-            "SM applies PRD property values only where the PRD environment defines them "
-            "explicitly (not 'Use revision source value'); otherwise the DEV value is deployed"
+            f"VQL recreates {len(kept)} datasource(s) as parameterized elements: {', '.join(kept)}. "
+            "The PRD values come from the SM environment properties; any property the PRD "
+            "environment leaves undefined or marks 'Use revision source value' gets the DEV value"
+        )
+    elif kept:
+        warnings.append(
+            f"VQL recreates {len(kept)} datasource(s) with literal DEV values: {', '.join(kept)}. "
+            "SM cannot replace literals; generate the VQL with 'includeProperties' = 'yes'"
         )
     if stripped:
         warnings.append(
@@ -227,7 +276,31 @@ def parse_desc_response(payload, dev_marker="ACLDTPLTFRM-DEV", strict_count=True
     if re.search(r"^CREATE OR REPLACE MAP i18n\b", vql, re.M):
         warnings.append("VQL overwrites server-level i18n map; confirm PRD has the same definition")
 
-    return DescResult(out_vql, requested, excluded, actual, warnings, ds_included, stripped)
+    # 9. properties file that goes with a parameterized VQL
+    properties = merged.get("properties")
+    if properties is not None and not isinstance(properties, str):
+        raise DescError("'properties' must be the text of the properties file")
+    if parameterized and not properties:
+        warnings.append("VQL is parameterized (REQUIRES-PROPERTIES-FILE) but the response carries no "
+                        "'properties'; it must be supplied separately (propertiesFile)")
+    if properties:
+        if not parameterized:
+            warnings.append("response carries 'properties' but the VQL has no ${variables}; ignored")
+            properties = None
+        else:
+            known = parse_properties(properties)
+            missing_vars = [v for v in variables if v not in known]
+            hard = [v for v in missing_vars if not v.endswith(".ENCRYPTED")]
+            soft = [v for v in missing_vars if v.endswith(".ENCRYPTED")]
+            if hard:
+                raise DescError("properties file has no value for variable(s): " + ", ".join(hard))
+            if soft:
+                warnings.append("properties file has no entry for: " + ", ".join(soft))
+            if stripped:
+                properties = _filter_properties(properties, set(variables))
+
+    return DescResult(out_vql, requested, excluded, actual, warnings, ds_included, stripped,
+                      properties, parameterized, variables)
 
 
 def load_response_file(path):
@@ -292,6 +365,8 @@ def main(argv=None):
     ap.add_argument("--lenient-count", action="store_true", help="statement_count mismatch = warning")
     ap.add_argument("--datasources", choices=("allow", "forbid"), default="allow",
                     help="allow: VQL may recreate datasources; forbid: reject any DATASOURCE statement")
+    ap.add_argument("--properties-out", default="",
+                    help="where to write the properties file carried by the response (if any)")
     ap.add_argument("--create-datasources", default="*",
                     help="* = keep all datasources (default); - = remove all; or db.ds,... = keep only those")
     args = ap.parse_args(argv)
@@ -312,6 +387,10 @@ def main(argv=None):
     print(f"DESC OK: {len(res.requested)} view(s), {res.statement_count} statements, "
           f"{len(res.datasources)} datasource(s) from DESC ({len(res.stripped_datasources)} removed), "
           f"{len(res.excluded)} excluded -> {args.out}")
+    if args.properties_out and res.properties:
+        with open(args.properties_out, "w", encoding="utf-8", newline="") as f:
+            f.write(res.properties)
+        print(f"properties -> {args.properties_out}")
     for w in res.warnings:
         print(f"##[warning]{w}")
     return 0

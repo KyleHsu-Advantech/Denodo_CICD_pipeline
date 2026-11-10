@@ -61,11 +61,17 @@ LOGIN_PATH = "/user/api/user/login"
 #       刪除瞬間相依物件一併消失，建立失敗會讓目標環境處於破損狀態。
 #   replaceExistingElements = yes
 #       產生 CREATE OR REPLACE，原子替換，失敗時舊物件仍在。
+#   includeProperties = yes
+#       與環境有關的值（datasource 的 URL、帳號、密碼，wrapper 的 ROUTE 等）
+#       輸出成 ${變數}，實際值另外放在 properties。
+#       沒有這個選項時，VQL 內是寫死的 DEV 值，SM 的環境屬性無從替換，
+#       部署後 PRD 會被蓋成 DEV 的值。
 DEFAULT_DESC_OPTIONS = {
     "includeDependencies": "yes",
     "include_dependencies_from_all_databases": "yes",
     "dropElements": "no",
     "replaceExistingElements": "yes",
+    "includeProperties": "yes",
 }
 SM_PREFIX = "/pool/DenodoSolutionManager"
 
@@ -286,12 +292,16 @@ def fetch_vql_from_api(components, api_path, options, database=None,
       - descvqlbatch JSON（{name, elements:[...]}）：由 desc_response 完整檢核，
         包含 status、請求的 view 是否都在、datasource 是否已排除、
         是否夾帶憑證、statement_count 是否一致。
+        MERGED 元素若帶有 properties 欄位（includeProperties=yes 時的 properties 檔內容），
+        會一併回傳。
       - 舊格式（純文字 VQL，或 JSON 的 vql / content / data / result 欄位）：
         原樣放行，不做上述檢核。
 
     response_file 有值時，不呼叫 APIM，改讀 repo 內存放的回傳檔，
     其餘流程（檢核、加工、建立 revision、驗證、部署）完全相同。
     用於 DESC API 尚未上線時，以真實回傳內容模擬整條流程。
+
+    回傳 (vql_base64, properties_base64 或 None, 是否為參數化 VQL)。
     """
     log("")
     log("--- 取得完整 VQL（含相依展開）---")
@@ -323,6 +333,10 @@ def fetch_vql_from_api(components, api_path, options, database=None,
             % (len(desc.requested), desc.statement_count, len(desc.datasources),
                len(desc.datasources) - len(desc.stripped_datasources),
                len(desc.stripped_datasources), len(desc.excluded)))
+        if desc.parameterized:
+            log("  參數化 VQL：%d 個 ${變數}，properties %s"
+                % (len(desc.variables),
+                   "由 DESC 回傳" if desc.properties else "未隨 DESC 回傳"))
         for w in desc.warnings:
             log("##[warning]%s" % w)
         # 回傳的 view 必須就是請求的那些，否則代表 API 處理的不是我們要過版的內容
@@ -357,6 +371,12 @@ def fetch_vql_from_api(components, api_path, options, database=None,
         log("##[warning]已指定 include_dependencies_from_all_databases=yes，"
             "輸出卻無 CONNECT DATABASE。若本次物件橫跨多個 database，"
             "可能有相依缺漏。")
+    # includeProperties 是否確實生效：生效時 VQL 帶 REQUIRES-PROPERTIES-FILE 標記。
+    if (options.get("includeProperties", "").lower() == "yes"
+            and "REQUIRES-PROPERTIES-FILE" not in text):
+        log("##[warning]已指定 includeProperties=yes，輸出卻沒有 REQUIRES-PROPERTIES-FILE 標記。"
+            "請確認 DESC API 有將選項轉交給 Denodo，否則環境相關的值會是寫死的 DEV 值，"
+            "SM 的環境屬性無法替換。")
 
     # 加工：DROP+CREATE 轉 CREATE OR REPLACE、補上 CONNECT DATABASE
     if transform:
@@ -385,7 +405,15 @@ def fetch_vql_from_api(components, api_path, options, database=None,
 
     encoded = base64.b64encode(raw).decode("ascii")
     log("  最終 %d bytes，base64 後 %d bytes" % (len(raw), len(encoded)))
-    return encoded
+
+    # properties 檔隨 DESC 回應一併取回（參數化 VQL 才有）
+    props_b64 = None
+    if desc and desc.properties:
+        props_raw = desc.properties.encode("utf-8")
+        props_b64 = base64.b64encode(props_raw).decode("ascii")
+        log("  properties %d bytes，base64 後 %d bytes" % (len(props_raw), len(props_b64)))
+
+    return encoded, props_b64, bool(desc and desc.parameterized)
 
 
 # ---------------------------------------------------------------- 1. 環境清單
@@ -952,7 +980,8 @@ def main():
     ap.add_argument("--vql-file", default="",
                     help="repo 內的 VQL 檔路徑，腳本自行讀檔並轉 base64（建議）")
     ap.add_argument("--properties-file", default="",
-                    help="repo 內的 properties 檔路徑，同上")
+                    help="repo 內的 properties 檔路徑，同上。"
+                         "DESC 回傳檔已帶 properties 時不需要")
     ap.add_argument("--vql-base64", default="",
                     help="直接傳入 base64 字串。大檔請改用 --vql-file")
     ap.add_argument("--properties-base64", default="",
@@ -1044,9 +1073,11 @@ def main():
             fail("回傳檔中找不到 requested_name：%s" % desc_file)
         log("由回傳檔取得 view 清單：%s" % ", ".join(components))
 
+    desc_props_b64 = None   # DESC 回應一併帶回的 properties（參數化 VQL）
+    parameterized = False   # VQL 是否為參數化格式（需要 properties）
     if components:
         desc_options = parse_desc_options(args.desc_options)
-        vql_b64 = fetch_vql_from_api(
+        vql_b64, desc_props_b64, parameterized = fetch_vql_from_api(
             components, args.desc_api_path, desc_options,
             database=None if args.database in placeholder else args.database,
             transform=not args.no_transform,
@@ -1064,12 +1095,19 @@ def main():
         fail("stage=%s 需要 --components、--vql-file 或 --vql-base64 其一"
              % args.stage)
 
+    # properties 來源，依序：--properties-file > --properties-base64 > DESC 回應
     if args.properties_file not in placeholder:
         props_b64 = read_as_base64(args.properties_file, "properties")
     elif args.properties_base64 not in placeholder:
         props_b64 = args.properties_base64
+    elif desc_props_b64:
+        props_b64 = desc_props_b64
     else:
         props_b64 = None
+
+    if parameterized and not props_b64:
+        fail("VQL 為參數化格式（REQUIRES-PROPERTIES-FILE），但沒有 properties。"
+             "請在 DESC 回傳檔的 properties 欄位，或以 propertiesFile 參數提供")
 
     revision_name = args.name
     if revision_name in placeholder:

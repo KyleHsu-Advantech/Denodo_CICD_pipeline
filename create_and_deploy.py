@@ -38,8 +38,9 @@ import time
 import requests
 
 from desc_response import (DescError, derive_properties, extract_vql,
-                           load_response_file, requested_names)
-from property_policy import classify_fallback
+                           load_response_file, parse_properties,
+                           requested_names, view_key)
+from property_policy import plan_properties
 
 
 BASE_URL = os.environ.get(
@@ -355,8 +356,8 @@ def fetch_vql_from_api(components, api_path, options,
         for w in desc.warnings:
             log("##[warning]%s" % w)
         # 回傳的 view 必須就是請求的那些，否則代表 API 處理的不是我們要過版的內容
-        want = {c.lower() for c in components}
-        got = {n.lower() for n in desc.requested}
+        want = {view_key(c) for c in components}
+        got = {view_key(n) for n in desc.requested}
         if want != got:
             fail("DESC 回傳的 view 與請求不一致。請求：%s；回傳：%s"
                  % (", ".join(sorted(want)), ", ".join(sorted(got))))
@@ -450,7 +451,7 @@ def _properties_from_literal_desc(desc, components, api_path, options,
         _, lit = extract_vql(body, ctype, create_datasources=create_datasources)
         if lit is None:
             raise DescError("includeProperties=no response is not in descvqlbatch format")
-        if {n.lower() for n in lit.requested} != {n.lower() for n in desc.requested}:
+        if {view_key(n) for n in lit.requested} != {view_key(n) for n in desc.requested}:
             raise DescError("the two DESC calls returned different views")
         if lit.variables:
             raise DescError("includeProperties=no output still contains ${variables}; "
@@ -644,30 +645,22 @@ def _fallback_allowed(name, patterns):
     return any(p in n for p in patterns)
 
 
-def validate_revision(revision_id, environment_id, description,
-                      allow_revision_fallback=False, allow_fallback_for=None,
-                      fallback_policy="new-elements", vql_text=""):
+def validate_revision(revision_id, environment_id, description):
     """驗證 revision 是否可安全部署到目標環境。
 
-    SM 即使驗證失敗也可能回 HTTP 200，因此必須檢查回應內容，
-    不能只看狀態碼。
+    SM 即使驗證失敗也可能回 HTTP 200，因此必須檢查回應內容，不能只看狀態碼。
 
-    三個 missing 欄位代表屬性值的回退層級：
+    回應中與屬性有關的欄位（revision 1031 實測）：
       missingVqlPropertiesWithServerValues
-          PRD 環境設定未定義，但 PRD 伺服器已有值 -> 用 server 的值（可接受）
+          目標環境未定義的屬性 -> {名稱: 目標伺服器現值}。只要有就驗證失敗；
+          元素在 PRD 已存在時現值即 PRD 正在用的值，新元素則沒有現值。
+          建立 revision 前已用 prepare_properties 處理，正常情況不應出現。
       missingVqlPropertiesUseRevisionValues
-          PRD 環境與 server 都沒有 -> 回退使用 revision（來源端 DEV）的值
-          這會讓開發環境的設定進入正式環境，預設視為錯誤
+          環境中定義為 Use revision source value、但 revision 沒帶值的屬性。
       missingSchPropertiesWithServerValues
-          同第一項，但針對 Scheduler
+          同第一項，但針對 Scheduler（不自動補建）。
 
-    fallback_policy 決定第二項的處理：
-      new-elements  只放行「整個元素在 PRD 都不存在」的屬性（新 datasource 及其 base view），
-                    PRD 既有元素的屬性一律不准套用 DEV 值（見 property_policy）
-      none          全部視為錯誤（舊行為）
-    allow_fallback_for / allow_revision_fallback 為人工覆寫，優先於上述判斷。
-
-    回傳 (ok: bool, summary: str, detail: dict)。
+    回傳 (ok, summary, detail)。
     """
     log("")
     log("--- 驗證 revision %s 對環境 %s ---" % (revision_id, environment_id))
@@ -684,7 +677,8 @@ def validate_revision(revision_id, environment_id, description,
         return False, "驗證回應非 JSON：%s" % resp.text[:300], {}
 
     v = payload.get("validation") or {}
-    problems = []
+    problems = []      # 缺少環境屬性以外的問題
+    vql_failure = None
 
     # 1) 整體與分項結果
     state = str(v.get("state", "")).upper()
@@ -694,8 +688,6 @@ def validate_revision(revision_id, environment_id, description,
     log("state=%s  VQL=%s  Scheduler=%s" % (state, vql_result, sch_result))
     log("訊息：%s" % v.get("messageResult", ""))
 
-    if state and state != "OK":
-        problems.append("整體驗證狀態為 %s" % state)
     if vql_result and vql_result != "OK":
         # errorVqlValidation 只是概述；outputVqlValidation 才列出是哪些屬性
         err = (v.get("errorVqlValidation") or "").strip()
@@ -707,8 +699,8 @@ def validate_revision(revision_id, environment_id, description,
                 log("##[error]  %s" % ln.strip()[:300])
         lines = [ln.strip() for ln in (err or out).splitlines()
                  if ln.strip() and not ln.strip().startswith("Error validating revision")]
-        problems.append("VQL 驗證失敗：%s"
-                        % (v.get("messageResult") or (lines[0] if lines else vql_result)).strip())
+        vql_failure = "VQL 驗證失敗：%s" % (
+            v.get("messageResult") or (lines[0] if lines else vql_result)).strip()
 
     # 回應中其他 missing* 欄位（不同 SM 版本欄位名稱不一），只記錄屬性名稱，不記錄值
     for key in sorted(v):
@@ -724,58 +716,30 @@ def validate_revision(revision_id, environment_id, description,
                         % (v.get("errorSchValidation")
                            or v.get("outputSchValidation") or sch_result))
 
-    # 2) 會回退使用來源端（DEV）值的屬性 —— 預設視為錯誤
-    #    例外：屬性名稱含 allow_fallback_for 任一字串者（例如新 datasource 的名稱）放行，
-    #    其餘仍視為錯誤。allow_revision_fallback 則是全部放行。
+    # 2) 定義為 Use revision source value、revision 卻沒帶值的屬性
     use_rev = v.get("missingVqlPropertiesUseRevisionValues") or []
-    patterns = [p.strip().lower() for p in (allow_fallback_for or []) if p.strip()]
-    allowed_fb = []
     if use_rev:
         log("")
-        log("以下屬性在目標環境與伺服器皆無值，將回退使用來源端的值：")
+        log("##[error]以下屬性在 PRD 環境設定為 Use revision source value，但 revision 沒有帶值：")
         for name in use_rev:
-            log("  %s" % name)
+            log("##[error]  %s" % name)
+        problems.append("有 %d 項屬性設定為沿用 revision 值，但 revision 沒有帶值" % len(use_rev))
 
-        def _summary(names):
-            return ("有 %d 項屬性會沿用開發環境的值（%s%s）"
-                    % (len(names), ", ".join(str(n) for n in names[:3]),
-                       " 等" if len(names) > 3 else ""))
-
-        with_server_names = list(v.get("missingVqlPropertiesWithServerValues") or {})
-        if allow_revision_fallback:
-            allowed_fb = list(use_rev)
-            log("##[warning]%s，已依 allowRevisionFallback 全部放行" % _summary(use_rev))
-        else:
-            manual = [n for n in use_rev if _fallback_allowed(n, patterns)]
-            rest = [n for n in use_rev if n not in manual]
-            if fallback_policy == "new-elements":
-                auto, blocked, reasons = classify_fallback(rest, with_server_names, vql_text)
-            else:
-                auto, blocked, reasons = [], rest, {}
-            allowed_fb = manual + auto
-            if auto:
-                log("##[warning]%s：屬於 PRD 尚不存在的新元素，將直接使用開發環境的值"
-                    % _summary(auto))
-            if manual:
-                log("##[warning]%s，已依 allowFallbackFor 放行" % _summary(manual))
-            for n in blocked:
-                if n in reasons:
-                    log("##[error]  %s：%s" % (n, reasons[n]))
-            if blocked:
-                problems.append(
-                    _summary(blocked)
-                    + "。請在 SM 的 PRD 環境設定這些屬性，或以 allowFallbackFor 指定放行")
-
-    # 3) 改用目標伺服器現有值的屬性 —— 警告但放行
+    # 3) 目標環境未定義的屬性
     with_server = v.get("missingVqlPropertiesWithServerValues") or {}
+    if isinstance(with_server, list):
+        with_server = {n: None for n in with_server}
     sch_server = v.get("missingSchPropertiesWithServerValues") or {}
-    for label, mapping in (("VQL", with_server), ("Scheduler", sch_server)):
-        if mapping:
-            log("")
-            log("##[warning]%s：有 %d 項屬性未在環境設定中定義，"
-                "將採用目標伺服器現有的值：" % (label, len(mapping)))
-            for name in list(mapping)[:20]:
-                log("##[warning]  %s" % name)
+    if with_server:
+        log("")
+        log("目標環境未定義的 VDP 屬性（%d 項）：" % len(with_server))
+        for name, val in list(with_server.items())[:50]:
+            log("  %s  [伺服器現值：%s]" % (name, "有" if val not in (None, "") else "無"))
+    if sch_server:
+        log("")
+        log("##[warning]Scheduler：有 %d 項屬性未在叢集設定中定義：" % len(sch_server))
+        for name in list(sch_server)[:20]:
+            log("##[warning]  %s" % name)
 
     # 4) 腳本層級的驗證結果
     for item in payload.get("scriptValidationsResult") or []:
@@ -791,18 +755,101 @@ def validate_revision(revision_id, environment_id, description,
         "vqlValidation": vql_result,
         "schedulerValidation": sch_result,
         "useRevisionValues": list(use_rev),
-        "allowedFallback": list(allowed_fb),
-        "withServerValues": list(with_server),
+        "missingEnvProperties": list(with_server),
         "message": v.get("messageResult", ""),
         "vqlValidationOutput": (v.get("outputVqlValidation") or "")[:1000],
     }
 
-    if problems:
-        return False, "；".join(problems), detail
+    ok = not problems and not vql_failure and state in ("", "OK")
+    if ok:
+        log("")
+        log("驗證通過，可安全部署")
+        return True, "驗證通過", detail
+
+    all_problems = problems + ([vql_failure] if vql_failure else []) or ["整體驗證狀態為 %s" % state]
+    return False, "；".join(all_problems), detail
+
+
+def _fallback_allowed(name, patterns):
+    """屬性名稱含任一指定字串（不分大小寫）即視為可放行。"""
+    n = str(name).lower()
+    return any(p in n for p in patterns)
+
+
+def get_env_properties(environment_id):
+    """目標環境已定義的 VDP 屬性 -> {名稱: {"undefined", "useRevisionSourceValue"}}。
+
+    回應含屬性值（密碼為加密字串），這裡只取名稱與旗標，值不保留也不記錄。
+    """
+    log("")
+    log("--- 取得環境 %s 已定義的 VDP 屬性 ---" % environment_id)
+    resp = _request("GET", "/environments/%s/vdpProperties" % environment_id, allow_404=True)
+    if resp is None:
+        fail("APIM 尚未發布 GET /environments/{id}/vdpProperties，無法判斷目標環境已定義哪些屬性")
+    try:
+        data = resp.json()
+    except ValueError:
+        fail("環境屬性回應非 JSON：%s" % resp.text[:300])
+    items = data if isinstance(data, list) else (
+        data.get("environmentProperties") or data.get("vdpProperties") or data.get("items") or [])
+    props = {}
+    for it in items:
+        if isinstance(it, dict) and it.get("name"):
+            props[str(it["name"])] = {"undefined": bool(it.get("undefined")),
+                                      "useRevisionSourceValue": bool(it.get("useRevisionSourceValue"))}
+    log("目標環境已定義 %d 項 VDP 屬性" % len(props))
+    return props
+
+
+def prepare_properties(vql_text, props_text, environment_id,
+                       allow_all=False, allow_for=None):
+    """建立 revision 前處理 VQL 中的 ${變數}，回傳處理後的 VQL。
+
+    目標環境已定義的保留為變數；PRD 尚無的元素把 DEV 值直接寫進 VQL；
+    無法安全判斷的中止。規則見 property_policy.plan_properties。
+    allow_for / allow_all 為人工覆寫：被擋下、但名稱符合者，若有 DEV 值則改寫入 DEV 值。
+    """
+    body = "\n".join(ln for ln in vql_text.splitlines() if not ln.lstrip().startswith("#"))
+    variables = sorted(set(re.findall(r"\$\{([^}]+)\}", body)))
+    if not variables:
+        return vql_text
+
+    env_props = get_env_properties(environment_id)
+    dev_props = parse_properties(props_text or "")
+    keep, inline, blocked = plan_properties(variables, env_props, dev_props, vql_text)
+
+    patterns = [p.strip().lower() for p in (allow_for or []) if p.strip()]
+    for name in list(blocked):
+        if (allow_all or _fallback_allowed(name, patterns)) and name in dev_props:
+            inline.append({"name": name, "value": dev_props[name],
+                           "secret": "PASSWORD" in name.upper(), "override": True})
+            del blocked[name]
 
     log("")
-    log("驗證通過，可安全部署")
-    return True, "驗證通過", detail
+    log("--- VQL 變數處理（共 %d 項）---" % len(variables))
+    for name in keep:
+        tag = "，設定為沿用 revision 值" if env_props.get(name, {}).get("useRevisionSourceValue") else ""
+        log("  保留 %s（目標環境已定義%s）" % (name, tag))
+    for item in inline:
+        shown = "******" if item["secret"] else item["value"]
+        log("  寫入 %s = %s（%s）" % (item["name"], shown[:150],
+            "依 allowFallbackFor 使用 DEV 值" if item.get("override") else "PRD 尚無此元素，使用 DEV 值"))
+    if any(i["secret"] for i in inline):
+        log("##[warning]新 datasource 的密碼以 DEV 匯出的加密字串寫入。若 PRD 的 VDP 使用不同的"
+            "加密金鑰，部署會成功但連線會失敗，請部署後測試連線")
+    if blocked:
+        for name, reason in blocked.items():
+            log("##[error]  無法自動處理 %s：%s" % (name, reason))
+        fail("有 %d 項 VQL 變數無法自動決定值，請在 SM 的目標環境設定後重跑：%s"
+             % (len(blocked), ", ".join(list(blocked)[:3])))
+
+    out = vql_text
+    for item in inline:
+        # 值位於 VQL 字串常值內，單引號寫成兩個；ENCRYPTED 旗標不在引號內，不受影響
+        out = out.replace("${%s}" % item["name"], str(item["value"]).replace("'", "''"))
+    if inline:
+        log("已將 %d 項 DEV 值寫入 VQL" % len(inline))
+    return out
 
 
 # ---------------------------------------------------------------- 5. 觸發部署
@@ -1082,15 +1129,13 @@ def main():
                          "PRD 的值交給 SM 的環境屬性機制；- = 全部從 VQL 剔除，PRD 既有的完全不動；"
                          "或逗號分隔的 db.ds / ds 清單，只放行列出的，其餘剔除")
     ap.add_argument("--allow-fallback-for", default="",
-                    help="逗號分隔。屬性名稱含其中任一字串者，允許回退使用來源端（DEV）的值，"
-                         "其餘仍視為錯誤。用於第一次上線的新 datasource（填其名稱）")
+                    help="逗號分隔。被規則擋下的變數，名稱含其中任一字串者改寫入 DEV 值")
     ap.add_argument("--fallback-policy", default="new-elements",
                     choices=("new-elements", "none"),
-                    help="new-elements（預設）：PRD 尚不存在的 datasource 與其 base view 自動使用 "
-                         "DEV 的值，PRD 既有元素一律不准套用 DEV 值；none：全部視為錯誤")
+                    help="建立 revision 前依目標環境已定義的屬性處理 ${變數}：new-elements（預設）"
+                         "已定義者保留、PRD 尚無的元素寫入 DEV 值；none：不處理，原樣送出")
     ap.add_argument("--allow-revision-fallback", action="store_true",
-                    help="允許屬性回退使用來源端（DEV）的值。"
-                         "預設視為錯誤並中止，僅在明確確認後才開啟")
+                    help="被規則擋下的變數一律改寫入 DEV 值。僅在明確確認後才開啟")
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--interval", type=int, default=10)
     args = ap.parse_args()
@@ -1206,6 +1251,19 @@ def main():
         else:
             fail("stage=%s 需要 --name" % args.stage)
 
+    # 建立 revision 前，依目標環境已定義的屬性處理 VQL 中的 ${變數}
+    if args.fallback_policy == "new-elements":
+        vql_before = base64.b64decode(vql_b64).decode("utf-8", errors="ignore")
+        vql_after = prepare_properties(
+            vql_before,
+            base64.b64decode(props_b64).decode("utf-8") if props_b64 else "",
+            environment_id,
+            allow_all=args.allow_revision_fallback,
+            allow_for=[p for p in args.allow_fallback_for.split(",")
+                       if p.strip() and p.strip() != "-"])
+        if vql_after != vql_before:
+            vql_b64 = base64.b64encode(vql_after.encode("utf-8")).decode("ascii")
+
     revision_id = create_revision(
         revision_name,
         "" if args.description in placeholder else args.description,
@@ -1218,14 +1276,8 @@ def main():
         return
 
     # 階段 4：驗證。失敗即中止，不往下部署。
-    ok, summary, detail = validate_revision(
-        revision_id, environment_id,
-        "" if args.description in placeholder else args.description,
-        allow_revision_fallback=args.allow_revision_fallback,
-        allow_fallback_for=[p for p in args.allow_fallback_for.split(",")
-                            if p.strip() and p.strip() != "-"],
-        fallback_policy=args.fallback_policy,
-        vql_text=base64.b64decode(vql_b64).decode("utf-8", errors="ignore"))
+    desc_text = "" if args.description in placeholder else args.description
+    ok, summary, detail = validate_revision(revision_id, environment_id, desc_text)
 
     # 輸出結構化結果，供呼叫端（bot）取用並呈現給使用者
     log("##vso[task.setvariable variable=validationState]%s"

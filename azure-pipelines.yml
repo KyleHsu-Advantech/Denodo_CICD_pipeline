@@ -91,7 +91,7 @@ parameters:
     type: string
     default: '-'
 
-  # 預設為 false：若有屬性會回退使用開發環境的值，驗證即失敗並中止。
+  # 預設 false。設為 true 時，被規則擋下的變數一律改寫入 DEV 的值。
   # 僅在明確確認過該差異可接受時才改為 true。
   # 字串而非 boolean：透過 REST API 的 templateParameters 傳入時，
   # 字串不會有型別轉換的歧義。
@@ -110,17 +110,20 @@ parameters:
     type: string
     default: '*'
 
-  # 驗證時「回退使用 revision（DEV）值」的屬性如何處理。
-  #   new-elements（預設）  PRD 尚不存在的 datasource 及其 base view 自動使用 DEV 的值；
-  #                         PRD 既有的元素一律不准套用 DEV 值（既有的取 PRD 環境設定或伺服器現值）
-  #   none                  全部視為錯誤，需逐一以 allowFallbackFor 放行（舊行為）
+  # 建立 revision 前，先讀取目標環境在 SM 已定義的 VDP 屬性
+  # （GET /environments/{id}/vdpProperties，唯讀），逐一處理 VQL 中的 ${變數}：
+  #   new-elements（預設）  目標環境已定義 -> 保留變數，部署時由 SM 帶入 PRD 的值
+  #                         未定義、且該元素在目標環境沒有任何屬性 -> 視為新元素，DEV 值直接寫進 VQL
+  #                         無法安全判斷的（既有元素新增的設定、既有 datasource 上的新 base view 等）
+  #                         會中止並列出，請在 SM 設定
+  #   none                  不處理，VQL 原樣送出
+  # 一次過版只建一個 revision，不會寫入 SM 的環境設定。
   - name: fallbackPolicy
     type: string
     default: 'new-elements'
     values: ['new-elements', 'none']
 
-  # 逗號分隔。屬性名稱含其中任一字串者，允許回退使用來源端（DEV）的值，
-  # 其餘仍視為錯誤。用於第一次上線的新 datasource（填其名稱，例如 ds_twse）。
+  # 逗號分隔。被規則擋下的變數，名稱含其中任一字串者改寫入 DEV 的值，其餘仍中止。
   # 比 allowRevisionFallback 安全：只放行指定的，不是全部。
   - name: allowFallbackFor
     type: string

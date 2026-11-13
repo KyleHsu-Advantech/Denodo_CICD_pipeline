@@ -69,6 +69,13 @@ parameters:
     type: string
     default: '-'
 
+  # 模擬用：同一批 view 以 'includeProperties' = 'no' 取得的 DESC 回傳檔。
+  # Denodo 的 DESC 只回傳 ${變數} 不回傳值，腳本比對兩份回傳檔取出 DEV 的值組成 properties。
+  # 呼叫真正的 DESC API 時腳本會自動打第二次，留 - 即可。
+  - name: descLiteralResponseFile
+    type: string
+    default: '-'
+
   # 目標環境，可填名稱或數字 id，腳本會自動解析
   - name: environment
     type: string
@@ -122,6 +129,15 @@ parameters:
   - name: createDatasources
     type: string
     default: '*'
+
+  # 驗證時「回退使用 revision（DEV）值」的屬性如何處理。
+  #   new-elements（預設）  PRD 尚不存在的 datasource 及其 base view 自動使用 DEV 的值；
+  #                         PRD 既有的元素一律不准套用 DEV 值（既有的取 PRD 環境設定或伺服器現值）
+  #   none                  全部視為錯誤，需逐一以 allowFallbackFor 放行（舊行為）
+  - name: fallbackPolicy
+    type: string
+    default: 'new-elements'
+    values: ['new-elements', 'none']
 
   # 逗號分隔。屬性名稱含其中任一字串者，允許回退使用來源端（DEV）的值，
   # 其餘仍視為錯誤。用於第一次上線的新 datasource（填其名稱，例如 ds_twse）。
@@ -192,6 +208,7 @@ steps:
         --components "${{ parameters.components }}"
         --desc-api-path "${{ parameters.descApiPath }}"
         --desc-response-file "${{ parameters.descResponseFile }}"
+        --desc-literal-response-file "${{ parameters.descLiteralResponseFile }}"
         --desc-options "${{ parameters.descOptions }}"
         --database "${{ parameters.database }}"
         ${{ variables.noTransformFlag }}
@@ -206,6 +223,7 @@ steps:
         --properties-base64 "${{ parameters.propertiesBase64 }}"
         --create-datasources "${{ parameters.createDatasources }}"
         --allow-fallback-for "${{ parameters.allowFallbackFor }}"
+        --fallback-policy "${{ parameters.fallbackPolicy }}"
         ${{ variables.allowRevisionFallbackFlag }}
     env:
       APIM_BASE_URL: $(apimBaseUrl)

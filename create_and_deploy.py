@@ -39,7 +39,6 @@ import requests
 
 from desc_response import (DescError, derive_properties, extract_vql,
                            load_response_file, requested_names)
-from vql_transform import transform_vql, format_stats
 from property_policy import classify_fallback
 
 
@@ -279,8 +278,7 @@ def _request(method, path, allow_404=False, **kwargs):
 
 # ------------------------------------------------- 1. 由 DESC API 取得 VQL
 
-def fetch_vql_from_api(components, api_path, options, database=None,
-                       transform=True, keep_drop_types=False,
+def fetch_vql_from_api(components, api_path, options,
                        response_file=None, create_datasources=None,
                        literal_response_file=None):
     """呼叫 APIM 上的 DESC API，取回展開相依後的完整 VQL。
@@ -300,7 +298,7 @@ def fetch_vql_from_api(components, api_path, options, database=None,
         原樣放行，不做上述檢核。
 
     response_file 有值時，不呼叫 APIM，改讀 repo 內存放的回傳檔，
-    其餘流程（檢核、加工、建立 revision、驗證、部署）完全相同。
+    其餘流程（檢核、建立 revision、驗證、部署）完全相同。
     用於 DESC API 尚未上線時，以真實回傳內容模擬整條流程。
 
     properties 的來源（參數化 VQL 才需要），依序：
@@ -371,7 +369,7 @@ def fetch_vql_from_api(components, api_path, options, database=None,
     text = raw.decode("utf-8", errors="ignore")
     log("  原始 VQL %d bytes" % len(raw))
 
-    # 檢核 DESC 選項是否確實生效。未生效時後面的加工會補救，
+    # 檢核 DESC 選項是否確實生效。程式不做補救，
     # 但問題的根源在 DESC API 的選項沒有傳對，應回頭修正。
     n_drop = len(re.findall(r"^\s*DROP\b", text, re.MULTILINE))
     n_replace = len(re.findall(r"CREATE\s+OR\s+REPLACE", text, re.IGNORECASE))
@@ -395,17 +393,7 @@ def fetch_vql_from_api(components, api_path, options, database=None,
             "請確認 DESC API 有將選項轉交給 Denodo，否則環境相關的值會是寫死的 DEV 值，"
             "SM 的環境屬性無法替換。")
 
-    # 加工：DROP+CREATE 轉 CREATE OR REPLACE、補上 CONNECT DATABASE
-    if transform:
-        text, stats = transform_vql(text, database=database,
-                                    keep_drop_types=keep_drop_types)
-        log("  加工：%s" % format_stats(stats))
-        raw = text.encode("utf-8")
-    elif database:
-        log("##[warning]未啟用加工，CONNECT DATABASE 不會加入，"
-            "物件將建在目標端的預設 database")
-
-    # 加工後仍殘留的破壞性語句，部署前須確認影響範圍
+    # VQL 原樣送出，不做加工。若含 DROP（DESC 選項未生效），部署前須確認影響範圍
     leftovers = [ln.strip() for ln in text.splitlines()
                  if ln.strip().upper().startswith("DROP")]
     if leftovers:
@@ -1043,14 +1031,6 @@ def main():
                     help="要過版的資料表清單，逗號分隔，須帶 database 前綴"
                          "（如 admin.rv_x,sap.rv_y）。"
                          "指定後會呼叫 DESC API 取得展開相依的完整 VQL")
-    ap.add_argument("--database", default="",
-                    help="僅在 DESC 輸出不含 CONNECT DATABASE 時才使用（舊版輸出）。"
-                         "新版 DESC 輸出自帶各 database 的 CONNECT，可留空")
-    ap.add_argument("--no-transform", action="store_true",
-                    help="不加工 VQL，原樣送出（保留 DROP + CREATE）")
-    ap.add_argument("--keep-drop-types", action="store_true",
-                    help="TYPE 保留 DROP+CREATE 原樣。"
-                         "若驗證回報 CREATE OR REPLACE TYPE 語法錯誤時使用")
     ap.add_argument("--desc-options", default="",
                     help="DESC VQL 匯出選項，格式 key=value,key2=value2。"
                          "留空則使用預設值（見 DEFAULT_DESC_OPTIONS）")
@@ -1169,9 +1149,6 @@ def main():
         desc_options = parse_desc_options(args.desc_options)
         vql_b64, desc_props_b64, parameterized = fetch_vql_from_api(
             components, args.desc_api_path, desc_options,
-            database=None if args.database in placeholder else args.database,
-            transform=not args.no_transform,
-            keep_drop_types=args.keep_drop_types,
             response_file=desc_file,
             literal_response_file=(None if args.desc_literal_response_file in placeholder
                                    else args.desc_literal_response_file),

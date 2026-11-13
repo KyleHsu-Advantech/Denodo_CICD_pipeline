@@ -1,479 +1,1312 @@
-#!/usr/bin/env python3
-"""Parse and validate a descvqlbatch response before it enters the deploy pipeline.
-
-Pipeline position:  DESC API  ->  desc_response.py  ->  SM loadFromVQL
-
-Usage:
-    python desc_response.py desc.json --out merged.vql [--dev-marker ACLDTPLTFRM-DEV]
-                            [--datasources allow|forbid] [--create-datasources '*'|'-'|db.ds,...]
-
-Exit code 0 = VQL written (warnings may be printed), 1 = validation failed.
-Output lines use the Azure DevOps ##[warning] / ##[error] prefixes.
 """
+串接 Denodo Solution Manager REST API（經由 Advantech APIM 轉送）
+
+認證流程：
+  0) 先向 APIM 的 user login 端點換取 JWT
+  1) 之後每支 API 都帶 Ocp-Apim-Subscription-Key + Authorization: Bearer <token>
+
+主流程：
+  1) 取得環境清單     (GET  /pool/DenodoSolutionManager/environments)
+  2) 取得環境內伺服器 (GET  /pool/DenodoSolutionManager/environments/{id}/servers)
+  3) 建立 Revision    (POST /pool/DenodoSolutionManager/revisions/loadFromVQL)
+  4) 驗證 Revision    (POST /pool/DenodoSolutionManager/revisions/{id}/validate)
+  5) 觸發部署         (POST /pool/DenodoSolutionManager/deployments)
+  6) 輪詢部署進度     (GET  /pool/DenodoSolutionManager/deployments/{id}/progress)
+
+環境變數（對應 pipeline 的 secret variable，程式不寫死任何憑證）：
+  APIM_BASE_URL          例如 https://ebizapis.advantech.com
+  APIM_SUBSCRIPTION_KEY
+  APIM_LOGIN_EMAIL
+  APIM_LOGIN_PASSWORD
+
+分階段測試：
+  --stage environments  只取環境清單（第一次測用這個）
+  --stage servers       再取某環境的 server 與 clusterId
+  --stage revision      建立 revision
+  --stage validate      建立並驗證
+  --stage deploy        完整跑到部署完成
+"""
+
 import argparse
+import base64
 import json
 import re
+import os
 import sys
-from dataclasses import dataclass, field
+import time
 
-OK_STATUSES = {"OK", "MERGED"}
+import requests
 
-# Statement starters at column 0. CLOSE and '#' comments are not counted; this
-# matches how the DESC API computes statement_count.
-STMT_RE = re.compile(r"^(?:CREATE|ALTER|CONNECT|DROP)\b", re.M)
-DB_BLOCK_RE = re.compile(r"^CONNECT DATABASE (\w+);[ \t]*$(.*?)^CLOSE;[ \t]*$", re.M | re.S)
-OBJ_RE = re.compile(r'^CREATE OR REPLACE (?:VIEW|TABLE) "?([\w$]+)"?', re.M)
-DS_START_RE = re.compile(r"^CREATE (?:OR REPLACE )?DATASOURCE\s+\S+\s+\"?([\w$]+)\"?")
-STMT_START_RE = re.compile(r"^(?:CREATE|ALTER|CONNECT|CLOSE|DROP)\b|^#")
-CONNECT_RE = re.compile(r"^CONNECT DATABASE (\w+);")
-# Credentials may appear only inside DATASOURCE statements, and only encrypted
-# (case-sensitive: column names such as "Password" are fine).
-SECRET_RE = re.compile(r"\bENCRYPTED\b|\b(?:USER)?PASSWORD\b\s*=?\s*'")
-# One PASSWORD literal: group 1 = the quoted value, group 2 = an ENCRYPTED flag right after it.
-PASSWORD_LITERAL_RE = re.compile(r"\b(?:USER)?PASSWORD\b\s*=?\s*'([^']*)'(\s*ENCRYPTED\b)?")
-# Parameterized VQL (DESC VQL ... 'includeProperties' = 'yes') uses ${variable} placeholders.
-PLACEHOLDER_RE = re.compile(r"\$\{([^}]+)\}")
-REQUIRES_PROPS_RE = re.compile(r"^#\s*REQUIRES-PROPERTIES-FILE\b", re.M)
+from desc_response import (DescError, derive_properties, extract_vql,
+                           load_response_file, parse_properties,
+                           requested_names, view_key)
+from property_policy import plan_properties
 
 
-class DescError(ValueError):
-    """The DESC response must not be deployed."""
+BASE_URL = os.environ.get(
+    "APIM_BASE_URL", "https://ebizapis.advantech.com").rstrip("/")
+SUB_KEY = os.environ.get("APIM_SUBSCRIPTION_KEY", "")
+LOGIN_EMAIL = os.environ.get("APIM_LOGIN_EMAIL", "")
+LOGIN_PASSWORD = os.environ.get("APIM_LOGIN_PASSWORD", "")
+
+LOGIN_PATH = "/user/api/user/login"
+
+# DESC VQL 的匯出選項，由 DESC API 轉交給 Denodo。
+#   includeDependencies
+#       一併匯出被引用的物件，否則只會得到目標 view 本身。
+#   include_dependencies_from_all_databases
+#       相依物件跨 database 時一併納入，並在開頭區塊依序排列。
+#       未開啟時，跨 db 的相依會缺漏。
+#   dropElements = no
+#       不產生 DROP 語句。預設的 DROP + CREATE 是先刪再建，
+#       刪除瞬間相依物件一併消失，建立失敗會讓目標環境處於破損狀態。
+#   replaceExistingElements = yes
+#       產生 CREATE OR REPLACE，原子替換，失敗時舊物件仍在。
+#   includeProperties = yes
+#       與環境有關的值（datasource 的 URL、帳號、密碼，wrapper 的 ROUTE 等）
+#       輸出成 ${變數}，實際值另外放在 properties。
+#       沒有這個選項時，VQL 內是寫死的 DEV 值，SM 的環境屬性無從替換，
+#       部署後 PRD 會被蓋成 DEV 的值。
+DEFAULT_DESC_OPTIONS = {
+    "includeDependencies": "yes",
+    "include_dependencies_from_all_databases": "yes",
+    "dropElements": "no",
+    "replaceExistingElements": "yes",
+    "includeProperties": "yes",
+}
+SM_PREFIX = "/pool/DenodoSolutionManager"
+
+TIMEOUT = 60
+
+_token = None
 
 
-@dataclass
-class DescResult:
-    vql: str
-    requested: list = field(default_factory=list)
-    excluded: list = field(default_factory=list)
-    statement_count: int = 0
-    warnings: list = field(default_factory=list)
-    datasources: list = field(default_factory=list)           # every datasource DESC brought out
-    stripped_datasources: list = field(default_factory=list)  # removed from the VQL (PRD keeps its own)
-    properties: str = None        # properties file text that goes with a parameterized VQL
-    parameterized: bool = False   # VQL uses ${variables} and needs a properties file
-    variables: list = field(default_factory=list)             # ${variables} left in the final VQL
+# ---------------------------------------------------------------- 工具
+
+# VQL 的 datasource 敘述帶有加密後的密碼。任何輸出（含 SM 回傳的錯誤內容）
+# 都先遮罩 PASSWORD / USERPASSWORD 後面的字串，避免寫進 pipeline log。
+# 只比對大寫關鍵字，欄位名稱如 "Password" 不受影響；
+# 結尾允許 $，涵蓋輸出被截斷、引號沒有收尾的情況。
+_SECRET_LOG_RE = re.compile(r"(\b(?:USER)?PASSWORD\b\s*=?\s*)'[^']*(?:'|$)")
 
 
-def _split_names(value):
-    return [n.strip() for n in (value or "").split(";") if n.strip()]
+def _mask_secrets(text):
+    return _SECRET_LOG_RE.sub(lambda m: m.group(1) + "'***'", str(text))
 
 
-def _objects_by_db(vql):
-    objs = {}
-    for m in DB_BLOCK_RE.finditer(vql):
-        objs.setdefault(m.group(1).lower(), set()).update(
-            n.lower() for n in OBJ_RE.findall(m.group(2))
-        )
-    return objs
+def log(msg):
+    print(_mask_secrets(msg), flush=True)
 
 
-def _split_datasources(vql):
-    """Split the VQL into (text without DATASOURCE statements, [(name, statement_text)])."""
-    rest, blocks, cur = [], [], None
-    for line in vql.splitlines(keepends=True):
-        m = DS_START_RE.match(line)
-        if m:
-            cur = (m.group(1), [line])
-            blocks.append(cur)
-            continue
-        if cur is not None and not STMT_START_RE.match(line):
-            cur[1].append(line)
-            continue
-        cur = None
-        rest.append(line)
-    return "".join(rest), [(n, "".join(ls)) for n, ls in blocks]
+def fail(msg):
+    print("##[error]%s" % _mask_secrets(msg), flush=True)
+    sys.exit(1)
 
 
-def _has_plaintext_password(block):
-    """True if a PASSWORD literal is neither a ${placeholder} nor flagged ENCRYPTED."""
-    for m in PASSWORD_LITERAL_RE.finditer(block):
-        value, encrypted = m.group(1), m.group(2)
-        if PLACEHOLDER_RE.fullmatch(value) or encrypted:
-            continue
-        return True
-    return False
+def _check_env():
+    missing = [n for n in ("APIM_SUBSCRIPTION_KEY",
+                           "APIM_LOGIN_EMAIL",
+                           "APIM_LOGIN_PASSWORD")
+               if not os.environ.get(n)]
+    if missing:
+        fail("缺少環境變數：%s（請確認 pipeline 已連結 variable group 並授權）"
+             % ", ".join(missing))
 
 
-def neutralize_comment_placeholders(vql):
-    """把 # 註解行裡的 ${x} 改寫成 <x>。回傳 (新 VQL, 改寫處數)。
+def _mask(s, keep=4):
+    """只露出開頭幾碼，避免憑證寫進 pipeline log。"""
+    if not s:
+        return "(空)"
+    return s[:keep] + "*" * max(0, len(s) - keep)
 
-    Solution Manager 解析變數時不會跳過註解，descvqlbatch 檔頭的說明文字
-    "environment values are ${...} variables" 會讓 SM 要求一個名為 "..." 的屬性。
-    註解不影響執行，改寫是安全的；非註解行完全不動。
+
+def parse_desc_options(raw):
+    """把 "key=value,key2=value2" 解析為 dict，並覆蓋預設值。
+
+    傳入空值或占位符時使用全部預設值。
     """
-    count = 0
-    out = []
-    for line in vql.splitlines(keepends=True):
-        if line.lstrip().startswith("#") and PLACEHOLDER_RE.search(line):
-            line, n = PLACEHOLDER_RE.subn(lambda m: "<%s>" % m.group(1), line)
-            count += n
-        out.append(line)
-    return "".join(out), count
+    options = dict(DEFAULT_DESC_OPTIONS)
+    if not raw or raw in ("", "-"):
+        return options
 
-
-def parse_properties(text):
-    """key=value lines of a properties file -> dict (comments and blank lines ignored)."""
-    props = {}
-    for raw in (text or "").splitlines():
-        line = raw.strip()
-        if not line or line[0] in "#!":
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
             continue
-        key, sep, value = line.partition("=")
-        if sep:
-            props[key.strip()] = value.strip()
+        if "=" not in item:
+            fail("DESC 選項格式錯誤：%s（應為 key=value）" % item)
+        k, v = item.split("=", 1)
+        options[k.strip()] = v.strip()
+    return options
+
+
+def build_desc_statement(components, options):
+    """組出對應的 DESC VQL 語句，僅供記錄與對照，實際由 DESC API 執行。"""
+    items = ", ".join("VIEW %s" % c for c in components)
+    opts = ", ".join("'%s' = '%s'" % (k, v) for k, v in sorted(options.items()))
+    return "DESC VQL LIST %s (%s)" % (items, opts)
+
+
+def read_as_base64(path, label):
+    """讀取檔案並轉成 base64。
+
+    Denodo 匯出的 VQL 與 properties 檔可能帶 UTF-8 BOM，
+    BOM 會讓 Solution Manager 解析失敗，必須先去除。
+    """
+    if not os.path.isfile(path):
+        fail("找不到 %s 檔案：%s" % (label, path))
+
+    with open(path, "rb") as f:
+        raw = f.read()
+
+    had_bom = raw.startswith(b"\xef\xbb\xbf")
+    if had_bom:
+        raw = raw[3:]
+
+    encoded = base64.b64encode(raw).decode("ascii")
+    log("%s：%s" % (label, path))
+    log("  原始大小 %d bytes，base64 後 %d bytes%s"
+        % (len(raw), len(encoded), "，已去除 BOM" if had_bom else ""))
+
+    # 提醒需要搭配 properties 檔的情形
+    head = raw[:500].decode("utf-8", errors="ignore")
+    if "REQUIRES-PROPERTIES-FILE" in head:
+        log("  注意：此 VQL 標記為需搭配 properties 檔，"
+            "未提供 properties 會導致連線參數無法解析")
+
+    return encoded
+
+
+# ---------------------------------------------------------------- 0. 取得 token
+
+def get_token():
+    """向 APIM 換取 JWT。token 有效期有限，每次 pipeline 執行都重新取得。"""
+    global _token
+
+    url = BASE_URL + LOGIN_PATH
+    log("取得 user token：POST %s" % url)
+    log("  帳號：%s" % LOGIN_EMAIL)
+
+    try:
+        resp = requests.post(
+            url,
+            json={"email": LOGIN_EMAIL, "password": LOGIN_PASSWORD},
+            headers={
+                "Content-Type": "application/json",
+                "Ocp-Apim-Subscription-Key": SUB_KEY,
+            },
+            timeout=TIMEOUT,
+        )
+    except requests.exceptions.RequestException as exc:
+        fail("登入請求失敗：%s" % exc)
+
+    log("HTTP %d" % resp.status_code)
+
+    if resp.status_code >= 400:
+        log("回應內容：%s" % resp.text[:1000])
+        if resp.status_code == 401:
+            log("提示：401 多半是帳密錯誤，或 subscription key 無效。")
+        fail("取得 token 失敗")
+
+    try:
+        data = resp.json()
+    except ValueError:
+        fail("登入回應非 JSON：%s" % resp.text[:500])
+
+    token = data.get("token")
+    if not token:
+        fail("登入回應中沒有 token 欄位：%s"
+             % json.dumps(data, ensure_ascii=False)[:500])
+
+    _token = token
+    log("已取得 token：%s（長度 %d）" % (_mask(token, 12), len(token)))
+    return token
+
+
+def _headers(json_body=True):
+    h = {
+        "Accept": "application/json",
+        "Ocp-Apim-Subscription-Key": SUB_KEY,
+        "Authorization": "Bearer %s" % _token,
+    }
+    if json_body:
+        h["Content-Type"] = "application/json"
+    return h
+
+
+def _request(method, path, allow_404=False, **kwargs):
+    """對 SM API 發出請求，失敗時印出完整回應以利除錯。
+
+    allow_404=True 時，404 不視為致命錯誤，回傳 None 由呼叫端決定如何處理。
+    用於 APIM 上可能尚未發布的 operation。
+    """
+    url = BASE_URL + SM_PREFIX + path
+    log("%s %s" % (method, url))
+
+    try:
+        resp = requests.request(
+            method, url,
+            headers=_headers(json_body="json" in kwargs),
+            timeout=TIMEOUT,
+            **kwargs
+        )
+    except requests.exceptions.Timeout:
+        fail("請求逾時（%d 秒）。APIM 的後端逾時可能更短，請檢查 APIM 設定。"
+             % TIMEOUT)
+    except requests.exceptions.RequestException as exc:
+        fail("連線失敗：%s" % exc)
+
+    log("HTTP %d" % resp.status_code)
+
+    if resp.status_code == 404 and allow_404:
+        log("此 operation 在 APIM 上不存在（404），略過")
+        return None
+
+    if resp.status_code >= 400:
+        log("回應內容：%s" % resp.text[:2000])
+        if resp.status_code == 401:
+            log("提示：401 可能是 token 已過期，或 APIM 未將 Authorization 轉給後端。")
+        elif resp.status_code == 403:
+            log("提示：403 可能是 subscription key 無效，或該帳號在 SM 權限不足。")
+        elif resp.status_code == 404:
+            log("提示：404 請確認 APIM 上該 operation 的路徑定義。")
+        elif resp.status_code == 413:
+            log("提示：413 代表 body 超過 APIM 大小上限，VQL 內容過大。")
+        fail("API 呼叫失敗：%s %s" % (method, path))
+
+    return resp
+
+
+# ------------------------------------------------- 1. 由 DESC API 取得 VQL
+
+def fetch_vql_from_api(components, api_path, options,
+                       response_file=None, create_datasources=None,
+                       literal_response_file=None):
+    """呼叫 APIM 上的 DESC API，取回展開相依後的完整 VQL。
+
+    一次送出全部 component，由 API 端合併去重後回傳單一份 VQL。
+    不可逐一呼叫後自行串接：DESC 輸出開頭帶有
+    DROP ... IF EXISTS ... CASCADE，多份串接時後面的 DROP
+    會把前面已建立的物件連帶刪除。
+
+    回應格式：
+      - descvqlbatch JSON（{name, elements:[...]}）：由 desc_response 完整檢核，
+        包含 status、請求的 view 是否都在、datasource 是否已排除、
+        是否夾帶憑證、statement_count 是否一致。
+        MERGED 元素若帶有 properties 欄位（includeProperties=yes 時的 properties 檔內容），
+        會一併回傳。
+      - 舊格式（純文字 VQL，或 JSON 的 vql / content / data / result 欄位）：
+        原樣放行，不做上述檢核。
+
+    response_file 有值時，不呼叫 APIM，改讀 repo 內存放的回傳檔，
+    其餘流程（檢核、建立 revision、驗證、部署）完全相同。
+    用於 DESC API 尚未上線時，以真實回傳內容模擬整條流程。
+
+    properties 的來源（參數化 VQL 才需要），依序：
+      1. DESC 回應本身的 properties 欄位
+      2. 再呼叫一次 DESC，選項改為 includeProperties=no，兩份逐行比對取出 DEV 的值
+         （Denodo 的 DESC VQL 只回傳 ${變數}，不回傳值，見 derive_properties）
+         模擬模式時改讀 literal_response_file。
+    最終 VQL 一律是參數化的那份；值只進 properties，PRD 用哪個值由 SM 決定。
+
+    回傳 (vql_base64, properties_base64 或 None, 是否為參數化 VQL)。
+    """
+    log("")
+    log("--- 取得完整 VQL（含相依展開）---")
+    log("  元件：%s" % ", ".join(components))
+    log("  DESC 選項：")
+    for k, v in sorted(options.items()):
+        log("    %s = %s" % (k, v))
+    log("  對應語句：%s"
+        % build_desc_statement(components, options)[:300])
+
+    if response_file:
+        log("##[warning]模擬模式：讀取回傳檔 %s，未呼叫 APIM 的 DESC API"
+            % response_file)
+        if not os.path.isfile(response_file):
+            fail("找不到 DESC 回傳檔：%s" % response_file)
+        body, ctype = load_response_file(response_file), "application/json"
+    else:
+        resp = _request("POST", api_path,
+                        json={"views": components, "options": options})
+        body, ctype = resp.text, resp.headers.get("Content-Type", "")
+
+    try:
+        vql, desc = extract_vql(body, ctype, create_datasources=create_datasources)
+    except DescError as exc:
+        fail("DESC 回應驗證未通過：%s" % exc)
+    if desc and desc.parameterized and not desc.properties:
+        desc.properties = _properties_from_literal_desc(
+            desc, components, api_path, options, response_file,
+            literal_response_file, create_datasources)
+        if desc.properties:
+            desc.warnings = [w for w in desc.warnings
+                             if "carries no 'properties'" not in w]
+
+    if desc:
+        log("  DESC 檢核通過：%d 個 view、%d 條語句；datasource：DESC 帶出 %d 個、"
+            "保留建立 %d 個、剔除 %d 個（交由目標環境既有的）、DESC 端排除 %d 個"
+            % (len(desc.requested), desc.statement_count, len(desc.datasources),
+               len(desc.datasources) - len(desc.stripped_datasources),
+               len(desc.stripped_datasources), len(desc.excluded)))
+        if desc.parameterized:
+            log("  參數化 VQL：%d 個 ${變數}，properties %s"
+                % (len(desc.variables),
+                   "由 DESC 回傳" if desc.properties else "未隨 DESC 回傳"))
+        for w in desc.warnings:
+            log("##[warning]%s" % w)
+        # 回傳的 view 必須就是請求的那些，否則代表 API 處理的不是我們要過版的內容
+        want = {view_key(c) for c in components}
+        got = {view_key(n) for n in desc.requested}
+        if want != got:
+            fail("DESC 回傳的 view 與請求不一致。請求：%s；回傳：%s"
+                 % (", ".join(sorted(want)), ", ".join(sorted(got))))
+
+    raw = vql.encode("utf-8")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+        log("  已去除 BOM")
+
+    text = raw.decode("utf-8", errors="ignore")
+    log("  原始 VQL %d bytes" % len(raw))
+
+    # 檢核 DESC 選項是否確實生效。程式不做補救，
+    # 但問題的根源在 DESC API 的選項沒有傳對，應回頭修正。
+    n_drop = len(re.findall(r"^\s*DROP\b", text, re.MULTILINE))
+    n_replace = len(re.findall(r"CREATE\s+OR\s+REPLACE", text, re.IGNORECASE))
+    n_connect = len(re.findall(r"^\s*CONNECT\s+DATABASE",
+                               text, re.IGNORECASE | re.MULTILINE))
+    log("  檢核：DROP %d 行、CREATE OR REPLACE %d 處、CONNECT DATABASE %d 處"
+        % (n_drop, n_replace, n_connect))
+
+    if options.get("dropElements", "").lower() == "no" and n_drop:
+        log("##[warning]已指定 dropElements=no，輸出卻仍含 %d 行 DROP。"
+            "請確認 DESC API 有將選項轉交給 Denodo。" % n_drop)
+    if (options.get("include_dependencies_from_all_databases", "").lower() == "yes"
+            and n_connect == 0):
+        log("##[warning]已指定 include_dependencies_from_all_databases=yes，"
+            "輸出卻無 CONNECT DATABASE。若本次物件橫跨多個 database，"
+            "可能有相依缺漏。")
+    # includeProperties 是否確實生效：生效時 VQL 帶 REQUIRES-PROPERTIES-FILE 標記。
+    if (options.get("includeProperties", "").lower() == "yes"
+            and "REQUIRES-PROPERTIES-FILE" not in text):
+        log("##[warning]已指定 includeProperties=yes，輸出卻沒有 REQUIRES-PROPERTIES-FILE 標記。"
+            "請確認 DESC API 有將選項轉交給 Denodo，否則環境相關的值會是寫死的 DEV 值，"
+            "SM 的環境屬性無法替換。")
+
+    # VQL 原樣送出，不做加工。若含 DROP（DESC 選項未生效），部署前須確認影響範圍
+    leftovers = [ln.strip() for ln in text.splitlines()
+                 if ln.strip().upper().startswith("DROP")]
+    if leftovers:
+        log("")
+        log("##[warning]VQL 仍含 %d 行 DROP，會先刪除再建立：" % len(leftovers))
+        for ln in leftovers[:10]:
+            log("##[warning]  %s" % ln[:120])
+        if len(leftovers) > 10:
+            log("##[warning]  （其餘 %d 行省略）" % (len(leftovers) - 10))
+
+    if not re.search(r"^\s*CONNECT\s+DATABASE", text, re.IGNORECASE | re.MULTILINE):
+        log("##[warning]VQL 未指定 CONNECT DATABASE，"
+            "物件會建在目標端的預設 database")
+
+    encoded = base64.b64encode(raw).decode("ascii")
+    log("  最終 %d bytes，base64 後 %d bytes" % (len(raw), len(encoded)))
+
+    # properties 檔隨 DESC 回應一併取回（參數化 VQL 才有）
+    props_b64 = None
+    if desc and desc.properties:
+        props_raw = desc.properties.encode("utf-8")
+        props_b64 = base64.b64encode(props_raw).decode("ascii")
+        log("  properties %d bytes，base64 後 %d bytes" % (len(props_raw), len(props_b64)))
+
+    return encoded, props_b64, bool(desc and desc.parameterized)
+
+
+def _properties_from_literal_desc(desc, components, api_path, options,
+                                  response_file, literal_response_file,
+                                  create_datasources):
+    """第二次 DESC（includeProperties=no），與參數化 VQL 比對後組出 properties 文字。
+
+    取不到時回傳 None，由後續「參數化卻沒有 properties」的檢查中止流程。
+    properties 內含加密後的密碼，只記錄數量，不記錄內容。
+    """
+    log("")
+    log("--- 取得 properties（第二次 DESC，includeProperties=no）---")
+    if literal_response_file:
+        if not os.path.isfile(literal_response_file):
+            fail("找不到 includeProperties=no 的 DESC 回傳檔：%s" % literal_response_file)
+        log("##[warning]模擬模式：讀取回傳檔 %s" % literal_response_file)
+        body, ctype = load_response_file(literal_response_file), "application/json"
+    elif response_file:
+        log("##[warning]模擬模式未提供 includeProperties=no 的回傳檔"
+            "（descLiteralResponseFile），無法推得 properties")
+        return None
+    else:
+        lit_options = dict(options, includeProperties="no")
+        resp = _request("POST", api_path,
+                        json={"views": components, "options": lit_options})
+        body, ctype = resp.text, resp.headers.get("Content-Type", "")
+
+    try:
+        _, lit = extract_vql(body, ctype, create_datasources=create_datasources)
+        if lit is None:
+            raise DescError("includeProperties=no response is not in descvqlbatch format")
+        if {view_key(n) for n in lit.requested} != {view_key(n) for n in desc.requested}:
+            raise DescError("the two DESC calls returned different views")
+        if lit.variables:
+            raise DescError("includeProperties=no output still contains ${variables}; "
+                            "the option did not reach Denodo")
+        props = derive_properties(desc.vql, lit.vql)
+    except DescError as exc:
+        fail("無法由兩次 DESC 推得 properties：%s" % exc)
+
+    n = sum(1 for ln in props.splitlines() if "=" in ln)
+    missing = [v for v in desc.variables if ("%s=" % v) not in props]
+    if missing:
+        fail("推得的 properties 缺少變數：%s" % ", ".join(missing))
+    log("  已推得 %d 項 properties（DEV 的值；PRD 實際採用哪個值由 SM 決定）" % n)
     return props
 
 
-def _filter_properties(text, used_keys):
-    """Keep comments/blank lines and only the properties the final VQL still references."""
-    out = []
-    for raw in text.splitlines(keepends=True):
-        line = raw.strip()
-        if not line or line[0] in "#!" or "=" not in line:
-            out.append(raw)
-        elif line.partition("=")[0].strip() in used_keys:
-            out.append(raw)
-    return "".join(out)
+# ---------------------------------------------------------------- 1. 環境清單
 
-
-def _strip_datasources(vql, keep):
-    """Remove DATASOURCE statements for which keep(db, name) is False.
-
-    Returns (new_vql, kept_names, stripped_names); names are 'db.ds'.
-    """
-    out, kept, stripped = [], [], []
-    db, skipping = None, False
-    for line in vql.splitlines(keepends=True):
-        c = CONNECT_RE.match(line)
-        if c:
-            db = c.group(1)
-        m = DS_START_RE.match(line)
-        if m:
-            full = "%s.%s" % (db, m.group(1)) if db else m.group(1)
-            if keep(db, m.group(1)):
-                kept.append(full)
-                skipping = False
-            else:
-                stripped.append(full)
-                skipping = True
-                continue
-        elif skipping:
-            if STMT_START_RE.match(line):
-                skipping = False
-            else:
-                continue
-        out.append(line)
-    return "".join(out), kept, stripped
-
-
-def parse_desc_response(payload, dev_marker="ACLDTPLTFRM-DEV", strict_count=True,
-                        datasources="allow", create_datasources=None):
-    """datasources='allow': the VQL may recreate datasources (SM then applies PRD property
-    values where defined). datasources='forbid': any DATASOURCE statement is rejected.
-
-    create_datasources (list or None) decides which datasources stay in the VQL:
-      None / ['*']   all stay (SM environment properties decide the PRD values)
-      []             all removed (PRD keeps whatever it already has)
-      ['db.ds', ...] only the listed ones stay ('ds' alone also matches); the rest are removed
-    """
-    if not isinstance(payload, dict) or payload.get("name") != "descvqlbatch":
-        raise DescError("unexpected payload: top-level name is not 'descvqlbatch'")
-    elements = payload.get("elements")
-    if not elements:
-        raise DescError("response has no elements")
-
-    # 1. every element must be OK / MERGED
-    bad = [e for e in elements if e.get("status") not in OK_STATUSES]
-    if bad:
-        detail = "; ".join(
-            f"{e.get('requested_name') or '<merged>'}: {e.get('status')} - {e.get('out_message')}"
-            for e in bad
-        )
-        raise DescError(f"DESC reported failures: {detail}")
-
-    # 2. exactly one MERGED element carrying the VQL
-    merged = [e for e in elements if e.get("status") == "MERGED"]
-    if len(merged) != 1:
-        raise DescError(f"expected exactly 1 MERGED element, got {len(merged)}")
-    merged = merged[0]
-    vql = merged.get("vql")
-    if not vql or not vql.strip():
-        raise DescError("MERGED element has empty vql")
-
-    requested = [e["requested_name"] for e in elements if e.get("requested_name")]
-    excluded = _split_names(merged.get("excluded_datasources"))
-    warnings = []
-
-    # 3. every requested view is really in the VQL, under the right database
-    objs = _objects_by_db(vql)
-    missing = []
-    for name in requested:
-        db, _, obj = name.partition(".")
-        if obj.lower() not in objs.get(db.lower(), set()):
-            missing.append(name)
-    if missing:
-        raise DescError(f"requested view(s) not found in VQL: {', '.join(missing)}")
-
-    # 4. datasources: allowed only under the 'allow' policy, and never with plaintext passwords
-    rest, ds_blocks = _split_datasources(vql)
-    ds_included = [n for n, _ in ds_blocks]
-    if ds_blocks and datasources == "forbid":
-        raise DescError(f"VQL contains datasource statements (PRD owns them): {', '.join(ds_included)}")
-    for name, block in ds_blocks:
-        if _has_plaintext_password(block):
-            raise DescError(f"datasource {name} carries a plaintext password (expected ENCRYPTED)")
-
-    # 5. credentials are tolerated only inside datasource statements
-    if SECRET_RE.search(rest):
-        raise DescError("VQL contains credential material outside datasource statements (PASSWORD/ENCRYPTED)")
-
-    # 6. statement_count consistency (counted on the VQL as DESC delivered it)
-    actual = len(STMT_RE.findall(vql))
-    declared = merged.get("statement_count")
-    if declared is not None and declared != actual:
-        msg = f"statement_count mismatch: declared {declared}, counted {actual}"
-        if strict_count:
-            raise DescError(msg)
-        warnings.append(msg)
-
-    # 7. decide which datasources stay in the VQL
-    out_vql, kept, stripped = vql, [f"?.{n}" for n in ds_included], []
-    if create_datasources is not None and ds_blocks:
-        wanted = {a.strip().lower() for a in create_datasources if a and a.strip()}
-        allow_all = "*" in wanted
-
-        def keep(db, name):
-            if allow_all:
-                return True
-            n = name.lower()
-            return n in wanted or bool(db and f"{db}.{n}".lower() in wanted)
-
-        out_vql, kept, stripped = _strip_datasources(vql, keep)
-    # 註解裡的 ${...} 也會被 SM 當成屬性（實測：SM 回報缺少屬性 "..."），送出前改寫掉
-    out_vql, n_neutralized = neutralize_comment_placeholders(out_vql)
-    if n_neutralized:
-        warnings.append(f"rewrote {n_neutralized} ${{...}} placeholder(s) inside # comments; "
-                        "SM would otherwise treat them as required properties")
-    # 註解行不算變數
-    variables = sorted(set(PLACEHOLDER_RE.findall(
-        "\n".join(ln for ln in out_vql.splitlines() if not ln.lstrip().startswith("#")))))
-    parameterized = bool(REQUIRES_PROPS_RE.search(vql)) or bool(variables)
-    if kept and parameterized:
-        warnings.append(
-            f"VQL recreates {len(kept)} datasource(s) as parameterized elements: {', '.join(kept)}. "
-            "The PRD values come from the SM environment properties; any property the PRD "
-            "environment leaves undefined or marks 'Use revision source value' gets the DEV value"
-        )
-    elif kept:
-        warnings.append(
-            f"VQL recreates {len(kept)} datasource(s) with literal DEV values: {', '.join(kept)}. "
-            "SM cannot replace literals; generate the VQL with 'includeProperties' = 'yes'"
-        )
-    if stripped:
-        warnings.append(
-            f"{len(stripped)} datasource(s) removed from the VQL, PRD must already have them: "
-            f"{', '.join(stripped)}"
-        )
-
-    # every datasource a wrapper refers to must be included here or already exist in PRD
-    wrapper_ds = {n.lower() for n in re.findall(r"DATASOURCENAME\s*=\s*\"?([\w$]+)", vql)}
-    covered = {n.lower() for n in ds_included} | {n.split(".")[-1].lower() for n in excluded}
-    unlisted = sorted(wrapper_ds - covered)
-    if unlisted:
-        warnings.append(
-            "wrapper uses datasource that is neither included nor listed in excluded_datasources "
-            f"(must already exist in PRD): {', '.join(unlisted)}"
-        )
-
-    # 8. warnings only: things the SM promotion step or a human should know about
-    dbs = list(dict.fromkeys(m.group(1) for m in DB_BLOCK_RE.finditer(vql)))
-    if dbs:
-        warnings.append("VQL will CONNECT to database(s) that must already exist in the "
-                        "target environment: " + ", ".join(dbs))
-    if dev_marker:
-        lines = [i for i, l in enumerate(out_vql.splitlines(), 1) if dev_marker in l]
-        if lines:
-            warnings.append(
-                f"{len(lines)} line(s) contain '{dev_marker}' (line {', '.join(map(str, lines[:5]))}"
-                f"{'...' if len(lines) > 5 else ''}); SM promotion config must override them in PRD"
-            )
-    if re.search(r"^CREATE OR REPLACE MAP i18n\b", vql, re.M):
-        warnings.append("VQL overwrites server-level i18n map; confirm PRD has the same definition")
-
-    # 9. properties file that goes with a parameterized VQL
-    properties = merged.get("properties")
-    if properties is not None and not isinstance(properties, str):
-        raise DescError("'properties' must be the text of the properties file")
-    if parameterized and not properties:
-        warnings.append("VQL is parameterized (REQUIRES-PROPERTIES-FILE) but the response carries no "
-                        "'properties'; it must be supplied separately (propertiesFile)")
-    if properties:
-        if not parameterized:
-            warnings.append("response carries 'properties' but the VQL has no ${variables}; ignored")
-            properties = None
-        else:
-            known = parse_properties(properties)
-            missing_vars = [v for v in variables if v not in known]
-            hard = [v for v in missing_vars if not v.endswith(".ENCRYPTED")]
-            soft = [v for v in missing_vars if v.endswith(".ENCRYPTED")]
-            if hard:
-                raise DescError("properties file has no value for variable(s): " + ", ".join(hard))
-            if soft:
-                warnings.append("properties file has no entry for: " + ", ".join(soft))
-            if stripped:
-                properties = _filter_properties(properties, set(variables))
-
-    return DescResult(out_vql, requested, excluded, actual, warnings, ds_included, stripped,
-                      properties, parameterized, variables)
-
-
-def derive_properties(param_vql, literal_vql):
-    """由同一份清單的兩次 DESC 輸出推得 properties 檔內容（DEV 的值）。
-
-    param_vql:   'includeProperties' = 'yes' 的 VQL（含 ${變數}）
-    literal_vql: 'includeProperties' = 'no'  的 VQL（同位置是實際值）
-
-    兩份除了變數位置與 # 註解外結構相同，逐行比對：把參數化那行的 ${x}
-    換成擷取群組，對另一份同一行做整行比對，即可取出 x 的值。
-    密碼取出的是加密字串；PASSWORD 後面的 ${...PASSWORD.ENCRYPTED} 會對到 ENCRYPTED。
-
-    回傳 properties 文字（key=value，依名稱排序）。對不上時丟 DescError，絕不猜值。
-    """
-    def body(text):
-        return [ln.rstrip() for ln in text.splitlines()
-                if ln.strip() and not ln.lstrip().startswith("#")]
-
-    p_lines, l_lines = body(param_vql), body(literal_vql)
-    if len(p_lines) != len(l_lines):
-        raise DescError("includeProperties yes/no outputs differ in length (%d vs %d lines); "
-                        "the two DESC calls did not describe the same elements"
-                        % (len(p_lines), len(l_lines)))
-
-    values = {}
-    for no, (p, l) in enumerate(zip(p_lines, l_lines), 1):
-        names = PLACEHOLDER_RE.findall(p)
-        if not names:
-            if p != l:
-                raise DescError("includeProperties yes/no outputs differ at statement line %d" % no)
-            continue
-        pattern = "".join(
-            re.escape(part) if i % 2 == 0 else "(.*?)"
-            for i, part in enumerate(PLACEHOLDER_RE.split(p)))
-        m = re.fullmatch(pattern, l)
-        if not m:
-            raise DescError("cannot align variable(s) %s at statement line %d"
-                            % (", ".join(names), no))
-        for name, value in zip(names, m.groups()):
-            if value.strip("*") == "" and value:
-                raise DescError("DESC returned a masked value (********) for %s; the DESC user "
-                                "needs WRITE privilege on the element, not only METADATA" % name)
-            if name in values and values[name] != value:
-                raise DescError("variable %s has two different values in the literal VQL" % name)
-            values[name] = value
-
-    return "".join("%s=%s\n" % (k, _escape_property(values[k])) for k in sorted(values))
-
-
-def _escape_property(value):
-    """Java .properties 跳脫：反斜線、開頭空白、非 ASCII（SM 以 ISO-8859-1 讀檔時才不會亂碼）。"""
-    out = value.replace("\\", "\\\\")
-    if out[:1] == " ":
-        out = "\\" + out
-    return "".join(c if ord(c) < 128 else "\\u%04x" % ord(c) for c in out)
-
-
-def load_response_file(path):
-    """Read a saved DESC response (UTF-8, BOM tolerated)."""
-    with open(path, "rb") as f:
-        return f.read().decode("utf-8-sig")
-
-
-def requested_names(body_text):
-    """requested_name of every element in a descvqlbatch response ([] if not that format)."""
-    try:
-        data = json.loads(body_text)
-    except ValueError:
-        return []
-    if not isinstance(data, dict):
-        return []
-    return [e["requested_name"] for e in data.get("elements") or [] if e.get("requested_name")]
-
-
-def extract_vql(body_text, content_type="", dev_marker="ACLDTPLTFRM-DEV", strict_count=True,
-                datasources="allow", create_datasources=None):
-    """Single entry point for create_and_deploy.fetch_vql_from_api.
-
-    Returns (vql_text, DescResult | None). DescResult is only set for the
-    descvqlbatch format, which is fully validated; legacy shapes (plain text,
-    JSON with vql/content/data/result) pass through unvalidated as before.
-    """
-    text = (body_text or "").strip()
-    if not text:
-        raise DescError("DESC API returned an empty body")
-
-    looks_json = "json" in (content_type or "").lower() or text[0] in "{["
-    if not looks_json:
-        return body_text, None
+def list_environments(quiet=False):
+    log("")
+    log("--- 取得環境清單 ---")
+    resp = _request("GET", "/environments")
 
     try:
-        data = json.loads(text)
+        data = resp.json()
     except ValueError:
-        if "json" in (content_type or "").lower():
-            raise DescError("response declared as JSON but could not be parsed")
-        return body_text, None  # plain VQL that happens to start with '{' / '['
+        fail("環境清單回應非 JSON：%s" % resp.text[:500])
 
-    if isinstance(data, dict) and data.get("name") == "descvqlbatch":
-        res = parse_desc_response(data, dev_marker, strict_count, datasources, create_datasources)
-        return res.vql, res
+    if not quiet:
+        log("完整回應：%s"
+            % json.dumps(data, ensure_ascii=False, indent=2)[:3000])
+
     if isinstance(data, list):
-        raise DescError("DESC API returned an array; expected one merged VQL "
-                        "(concatenating separate DESC outputs lets later DROP CASCADE delete earlier objects)")
-    if isinstance(data, dict):
-        for key in ("vql", "content", "data", "result"):
-            if data.get(key):
-                return data[key], None
-        raise DescError("no VQL field in response: " + json.dumps(data, ensure_ascii=False)[:300])
-    return str(data), None
+        items = data
+    else:
+        items = data.get("environments") or data.get("items") or []
+
+    log("")
+    log("環境摘要：")
+    for env in items:
+        log("  id=%s  name=%s" % (env.get("id"), env.get("name")))
+
+    return items
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("input", help="descvqlbatch response JSON file")
-    ap.add_argument("--out", required=True, help="where to write the merged VQL")
-    ap.add_argument("--dev-marker", default="ACLDTPLTFRM-DEV")
-    ap.add_argument("--lenient-count", action="store_true", help="statement_count mismatch = warning")
-    ap.add_argument("--datasources", choices=("allow", "forbid"), default="allow",
-                    help="allow: VQL may recreate datasources; forbid: reject any DATASOURCE statement")
-    ap.add_argument("--properties-out", default="",
-                    help="where to write the properties file carried by the response (if any)")
-    ap.add_argument("--create-datasources", default="*",
-                    help="* = keep all datasources (default); - = remove all; or db.ds,... = keep only those")
-    args = ap.parse_args(argv)
+def resolve_environment_id(environments, wanted):
+    """把使用者給的環境名稱或 id 解析成實際的 environment id。
 
-    create = [p.strip() for p in args.create_datasources.split(",") if p.strip() and p.strip() != "-"]
+    接受 "ACLDTPLTFRM-PRD" 這種名稱，也接受純數字 id。
+    名稱比對不分大小寫。
+    """
+    wanted = str(wanted).strip()
 
-    with open(args.input, encoding="utf-8") as f:
-        payload = json.load(f)
+    # 純數字就直接當 id 用，但仍確認它存在
+    if wanted.isdigit():
+        for env in environments:
+            if str(env.get("id")) == wanted:
+                log("目標環境：id=%s name=%s"
+                    % (env.get("id"), env.get("name")))
+                return int(wanted)
+        fail("環境清單中找不到 id=%s" % wanted)
+
+    for env in environments:
+        if str(env.get("name", "")).strip().lower() == wanted.lower():
+            log("目標環境：name=%s 解析為 id=%s"
+                % (env.get("name"), env.get("id")))
+            return int(env["id"])
+
+    names = ", ".join(str(e.get("name")) for e in environments)
+    fail("環境清單中找不到名稱 %s。可用的環境：%s" % (wanted, names))
+
+
+# ---------------------------------------------------------------- 2. 伺服器清單
+
+def list_servers(environment_id, allow_missing=False):
+    log("")
+    log("--- 取得環境 %s 的伺服器 ---" % environment_id)
+    resp = _request("GET", "/environments/%s/servers" % environment_id,
+                    allow_404=allow_missing)
+
+    if resp is None:
+        log("提示：APIM 尚未發布 /environments/{id}/servers，")
+        log("      無法自動推導 clusterId。")
+        return None
+
     try:
-        res = parse_desc_response(payload, args.dev_marker, strict_count=not args.lenient_count,
-                                  datasources=args.datasources, create_datasources=create)
-    except DescError as e:
-        print(f"##[error]DESC validation failed: {e}")
-        return 1
+        data = resp.json()
+    except ValueError:
+        fail("伺服器清單回應非 JSON：%s" % resp.text[:500])
 
-    with open(args.out, "w", encoding="utf-8", newline="") as f:  # UTF-8, keep \n as-is
-        f.write(res.vql)
-    print(f"DESC OK: {len(res.requested)} view(s), {res.statement_count} statements, "
-          f"{len(res.datasources)} datasource(s) from DESC ({len(res.stripped_datasources)} removed), "
-          f"{len(res.excluded)} excluded -> {args.out}")
-    if args.properties_out and res.properties:
-        with open(args.properties_out, "w", encoding="utf-8", newline="") as f:
-            f.write(res.properties)
-        print(f"properties -> {args.properties_out}")
-    for w in res.warnings:
-        print(f"##[warning]{w}")
-    return 0
+    log("完整回應：%s" % json.dumps(data, ensure_ascii=False, indent=2)[:3000])
+
+    if isinstance(data, list):
+        items = data
+    else:
+        # SM 實際回傳 {"servers": [...]}；保留其他鍵名以防版本差異
+        items = data.get("servers") or data.get("items") or []
+
+    log("")
+    log("伺服器摘要：")
+    for srv in items:
+        log("  id=%s name=%s type=%s clusterId=%s enabled=%s"
+            % (srv.get("id"), srv.get("name"), srv.get("typeNode"),
+               srv.get("clusterId"), srv.get("enabled")))
+
+    cluster_ids = sorted({str(s.get("clusterId")) for s in items
+                          if s.get("clusterId") is not None})
+    if cluster_ids:
+        log("")
+        log("可用的 clusterId：%s" % ", ".join(cluster_ids))
+
+    return items
+
+
+def pick_cluster_id(servers):
+    """由 server 清單推導出要部署的 clusterId。
+
+    只取啟用中的 VDP 節點。若找不到或有多個，不靜默猜測，
+    而是印出完整資訊要求明確指定。
+    """
+    candidates = []
+    for srv in servers:
+        cid = srv.get("clusterId")
+        if cid is None:
+            continue
+        node_type = str(srv.get("typeNode", "")).upper()
+        enabled = srv.get("enabled")
+        # 只取 VDP 節點。注意 VDP_DATA_CATALOG 與 SCHEDULER 都不是部署目標，
+        # 因此必須精確比對，不能用子字串判斷。
+        if node_type and node_type != "VDP":
+            continue
+        if enabled is False:
+            continue
+        candidates.append((int(cid), srv.get("name")))
+
+    unique = sorted({c for c, _ in candidates})
+
+    if not unique:
+        log("servers 完整內容：%s"
+            % json.dumps(servers, ensure_ascii=False, indent=2)[:2000])
+        fail("無法從 server 清單推導 clusterId，請以 --cluster-id 明確指定")
+
+    if len(unique) > 1:
+        log("偵測到多個 clusterId：%s"
+            % ", ".join(str(c) for c in unique))
+        for cid, name in candidates:
+            log("  clusterId=%s server=%s" % (cid, name))
+        fail("目標環境有多個 cluster，請以 --cluster-id 明確指定要部署的那一個")
+
+    log("自動推導 clusterId = %s" % unique[0])
+    return unique[0]
+
+
+# ---------------------------------------------------------------- 3. 建立 Revision
+
+def create_revision(name, description, vql_b64, properties_b64=None):
+    """由 VQL 建立 revision。
+
+    content 與 properties 必須是 base64 編碼的 UTF-8 內容，
+    且 VQL 不得含 BOM，否則 SM 解析會失敗。
+    這一步同時驗證 APIM 轉送過程有沒有破壞 base64 字串。
+    """
+    log("")
+    log("--- 建立 revision：%s ---" % name)
+    log("  VQL base64 長度：%d" % len(vql_b64))
+
+    body = {"name": name, "content": vql_b64}
+    if description:
+        body["description"] = description
+    if properties_b64:
+        body["properties"] = properties_b64
+        log("  properties base64 長度：%d" % len(properties_b64))
+
+    resp = _request("POST", "/revisions/loadFromVQL", json=body)
+    data = resp.json()
+
+    log("完整回應：%s" % json.dumps(data, ensure_ascii=False, indent=2)[:2000])
+    log("")
+    log("revision id = %s" % data.get("id"))
+    log("  useDefaultDatabase = %s" % data.get("useDefaultDatabase"))
+    log("  replace            = %s" % data.get("replace"))
+
+    return data["id"]
+
+
+# ---------------------------------------------------------------- 4. 驗證
+
+def _fallback_allowed(name, patterns):
+    """屬性名稱含任一指定字串（不分大小寫）即視為可放行。"""
+    n = str(name).lower()
+    return any(p in n for p in patterns)
+
+
+def validate_revision(revision_id, environment_id, description):
+    """驗證 revision 是否可安全部署到目標環境。
+
+    SM 即使驗證失敗也可能回 HTTP 200，因此必須檢查回應內容，不能只看狀態碼。
+
+    回應中與屬性有關的欄位（revision 1031 實測）：
+      missingVqlPropertiesWithServerValues
+          目標環境未定義的屬性 -> {名稱: 目標伺服器現值}。只要有就驗證失敗；
+          元素在 PRD 已存在時現值即 PRD 正在用的值，新元素則沒有現值。
+          建立 revision 前已用 prepare_properties 處理，正常情況不應出現。
+      missingVqlPropertiesUseRevisionValues
+          環境中定義為 Use revision source value、但 revision 沒帶值的屬性。
+      missingSchPropertiesWithServerValues
+          同第一項，但針對 Scheduler（不自動補建）。
+
+    回傳 (ok, summary, detail)。
+    """
+    log("")
+    log("--- 驗證 revision %s 對環境 %s ---" % (revision_id, environment_id))
+
+    body = {
+        "environmentId": str(environment_id),
+        "description": description or ("validate revision %s" % revision_id),
+    }
+    resp = _request("POST", "/revisions/%s/validate" % revision_id, json=body)
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        return False, "驗證回應非 JSON：%s" % resp.text[:300], {}
+
+    v = payload.get("validation") or {}
+    problems = []      # 缺少環境屬性以外的問題
+    vql_failure = None
+
+    # 1) 整體與分項結果
+    state = str(v.get("state", "")).upper()
+    vql_result = str(v.get("resultVqlValidation", "")).upper()
+    sch_result = str(v.get("resultSchValidation", "")).upper()
+
+    log("state=%s  VQL=%s  Scheduler=%s" % (state, vql_result, sch_result))
+    log("訊息：%s" % v.get("messageResult", ""))
+
+    if vql_result and vql_result != "OK":
+        # errorVqlValidation 只是概述；outputVqlValidation 才列出是哪些屬性
+        err = (v.get("errorVqlValidation") or "").strip()
+        out = (v.get("outputVqlValidation") or "").strip()
+        log("")
+        log("##[error]SM VQL 驗證輸出：")
+        for ln in (out or err or vql_result).splitlines():
+            if ln.strip():
+                log("##[error]  %s" % ln.strip()[:300])
+        lines = [ln.strip() for ln in (err or out).splitlines()
+                 if ln.strip() and not ln.strip().startswith("Error validating revision")]
+        vql_failure = "VQL 驗證失敗：%s" % (
+            v.get("messageResult") or (lines[0] if lines else vql_result)).strip()
+
+    # 回應中其他 missing* 欄位（不同 SM 版本欄位名稱不一），只記錄屬性名稱，不記錄值
+    for key in sorted(v):
+        if key.startswith("missing") and key not in (
+                "missingVqlPropertiesUseRevisionValues",
+                "missingVqlPropertiesWithServerValues",
+                "missingSchPropertiesWithServerValues") and v[key]:
+            names = list(v[key])
+            log("##[warning]%s（%d 項）：%s" % (key, len(names),
+                                             ", ".join(str(n) for n in names[:20])))
+    if sch_result and sch_result != "OK":
+        problems.append("Scheduler 驗證失敗：%s"
+                        % (v.get("errorSchValidation")
+                           or v.get("outputSchValidation") or sch_result))
+
+    # 2) 定義為 Use revision source value、revision 卻沒帶值的屬性
+    use_rev = v.get("missingVqlPropertiesUseRevisionValues") or []
+    if use_rev:
+        log("")
+        log("##[error]以下屬性在 PRD 環境設定為 Use revision source value，但 revision 沒有帶值：")
+        for name in use_rev:
+            log("##[error]  %s" % name)
+        problems.append("有 %d 項屬性設定為沿用 revision 值，但 revision 沒有帶值" % len(use_rev))
+
+    # 3) 目標環境未定義的屬性
+    with_server = v.get("missingVqlPropertiesWithServerValues") or {}
+    if isinstance(with_server, list):
+        with_server = {n: None for n in with_server}
+    sch_server = v.get("missingSchPropertiesWithServerValues") or {}
+    if with_server:
+        log("")
+        log("目標環境未定義的 VDP 屬性（%d 項）：" % len(with_server))
+        for name, val in list(with_server.items())[:50]:
+            log("  %s  [伺服器現值：%s]" % (name, "有" if val not in (None, "") else "無"))
+    if sch_server:
+        log("")
+        log("##[warning]Scheduler：有 %d 項屬性未在叢集設定中定義：" % len(sch_server))
+        for name in list(sch_server)[:20]:
+            log("##[warning]  %s" % name)
+
+    # 4) 腳本層級的驗證結果
+    for item in payload.get("scriptValidationsResult") or []:
+        st = str(item.get("state", item.get("result", ""))).upper()
+        if st and st != "OK":
+            problems.append("腳本驗證未通過：%s"
+                            % json.dumps(item, ensure_ascii=False)[:300])
+
+    detail = {
+        "revisionId": revision_id,
+        "environment": (v.get("targetEnvironment") or {}).get("name"),
+        "state": state,
+        "vqlValidation": vql_result,
+        "schedulerValidation": sch_result,
+        "useRevisionValues": list(use_rev),
+        "missingEnvProperties": list(with_server),
+        "message": v.get("messageResult", ""),
+        "vqlValidationOutput": (v.get("outputVqlValidation") or "")[:1000],
+    }
+
+    ok = not problems and not vql_failure and state in ("", "OK")
+    if ok:
+        log("")
+        log("驗證通過，可安全部署")
+        return True, "驗證通過", detail
+
+    all_problems = problems + ([vql_failure] if vql_failure else []) or ["整體驗證狀態為 %s" % state]
+    return False, "；".join(all_problems), detail
+
+
+def _fallback_allowed(name, patterns):
+    """屬性名稱含任一指定字串（不分大小寫）即視為可放行。"""
+    n = str(name).lower()
+    return any(p in n for p in patterns)
+
+
+def get_env_properties(environment_id):
+    """目標環境已定義的 VDP 屬性 -> {名稱: {"undefined", "useRevisionSourceValue"}}。
+
+    回應含屬性值（密碼為加密字串），這裡只取名稱與旗標，值不保留也不記錄。
+    """
+    log("")
+    log("--- 取得環境 %s 已定義的 VDP 屬性 ---" % environment_id)
+    resp = _request("GET", "/environments/%s/vdpProperties" % environment_id, allow_404=True)
+    if resp is None:
+        fail("APIM 尚未發布 GET /environments/{id}/vdpProperties，無法判斷目標環境已定義哪些屬性")
+    try:
+        data = resp.json()
+    except ValueError:
+        fail("環境屬性回應非 JSON：%s" % resp.text[:300])
+    items = data if isinstance(data, list) else (
+        data.get("environmentProperties") or data.get("vdpProperties") or data.get("items") or [])
+    props = {}
+    for it in items:
+        if isinstance(it, dict) and it.get("name"):
+            props[str(it["name"])] = {"undefined": bool(it.get("undefined")),
+                                      "useRevisionSourceValue": bool(it.get("useRevisionSourceValue"))}
+    log("目標環境已定義 %d 項 VDP 屬性" % len(props))
+    return props
+
+
+def prepare_properties(vql_text, props_text, environment_id,
+                       allow_all=False, allow_for=None):
+    """建立 revision 前處理 VQL 中的 ${變數}，回傳處理後的 VQL。
+
+    目標環境已定義的保留為變數；PRD 尚無的元素把 DEV 值直接寫進 VQL；
+    無法安全判斷的中止。規則見 property_policy.plan_properties。
+    allow_for / allow_all 為人工覆寫：被擋下、但名稱符合者，若有 DEV 值則改寫入 DEV 值。
+    """
+    body = "\n".join(ln for ln in vql_text.splitlines() if not ln.lstrip().startswith("#"))
+    variables = sorted(set(re.findall(r"\$\{([^}]+)\}", body)))
+    if not variables:
+        return vql_text
+
+    env_props = get_env_properties(environment_id)
+    dev_props = parse_properties(props_text or "")
+    keep, inline, blocked = plan_properties(variables, env_props, dev_props, vql_text)
+
+    patterns = [p.strip().lower() for p in (allow_for or []) if p.strip()]
+    for name in list(blocked):
+        if (allow_all or _fallback_allowed(name, patterns)) and name in dev_props:
+            inline.append({"name": name, "value": dev_props[name],
+                           "secret": "PASSWORD" in name.upper(), "override": True})
+            del blocked[name]
+
+    log("")
+    log("--- VQL 變數處理（共 %d 項）---" % len(variables))
+    for name in keep:
+        tag = "，設定為沿用 revision 值" if env_props.get(name, {}).get("useRevisionSourceValue") else ""
+        log("  保留 %s（目標環境已定義%s）" % (name, tag))
+    for item in inline:
+        shown = "******" if item["secret"] else item["value"]
+        log("  寫入 %s = %s（%s）" % (item["name"], shown[:150],
+            "依 allowFallbackFor 使用 DEV 值" if item.get("override") else "PRD 尚無此元素，使用 DEV 值"))
+    if any(i["secret"] for i in inline):
+        log("##[warning]新 datasource 的密碼以 DEV 匯出的加密字串寫入。若 PRD 的 VDP 使用不同的"
+            "加密金鑰，部署會成功但連線會失敗，請部署後測試連線")
+    if blocked:
+        for name, reason in blocked.items():
+            log("##[error]  無法自動處理 %s：%s" % (name, reason))
+        fail("有 %d 項 VQL 變數無法自動決定值，請在 SM 的目標環境設定後重跑：%s"
+             % (len(blocked), ", ".join(list(blocked)[:3])))
+
+    out = vql_text
+    for item in inline:
+        # 值位於 VQL 字串常值內，單引號寫成兩個；ENCRYPTED 旗標不在引號內，不受影響
+        out = out.replace("${%s}" % item["name"], str(item["value"]).replace("'", "''"))
+    if inline:
+        log("已將 %d 項 DEV 值寫入 VQL" % len(inline))
+    return out
+
+
+# ---------------------------------------------------------------- 5. 觸發部署
+
+def start_deployment(revision_ids, environment_id, description=""):
+    """觸發部署。
+
+    依官方文件，body 必須包含：
+      revisionIds    revision 識別碼的清單，部署會依陣列順序逐一執行
+      environmentId  目標環境識別碼
+      description    選填
+
+    注意 clusterId 不是此 API 的參數，部署對象由 environmentId 決定。
+
+    若目標環境缺少必要屬性，部署會失敗，且回應中會帶回驗證結果，
+    因此失敗時要把完整回應保留下來供判讀。
+    """
+    if not isinstance(revision_ids, (list, tuple)):
+        revision_ids = [revision_ids]
+
+    log("")
+    log("--- 觸發部署 ---")
+    log("  revisionIds=%s environmentId=%s"
+        % (list(revision_ids), environment_id))
+
+    body = {
+        "revisionIds": [int(r) for r in revision_ids],
+        "environmentId": int(environment_id),
+    }
+    if description:
+        body["description"] = description
+
+    resp = _request("POST", "/deployments", json=body)
+    data = resp.json()
+
+    # 部署失敗時，回應可能是驗證結果而非 deployment 物件
+    if isinstance(data, dict) and "validationResponse" in data:
+        v = (data.get("validationResponse") or {}).get("validation") or {}
+        log("完整回應：%s" % json.dumps(data, ensure_ascii=False)[:2500])
+        missing = v.get("missingVqlPropertiesUseRevisionValues") or []
+        if missing:
+            log("")
+            log("目標環境缺少下列屬性，且其設定為沿用 revision 值：")
+            for name in missing:
+                log("  %s" % name)
+        fail("部署未開始：%s"
+             % (v.get("errorVqlValidation")
+                or v.get("outputVqlValidation")
+                or "目標環境驗證未通過"))
+
+    log("完整回應：%s" % json.dumps(data, ensure_ascii=False, indent=2)[:2000])
+
+    # SM 實際回傳 {"deploymentId": N}；保留 id 以相容其他版本
+    if isinstance(data, dict):
+        deployment_id = data.get("deploymentId") or data.get("id")
+    else:
+        deployment_id = data
+    if deployment_id is None:
+        fail("回應中找不到 deployment id：%s"
+             % json.dumps(data, ensure_ascii=False)[:500])
+
+    log("deployment id = %s" % deployment_id)
+    return deployment_id
+
+
+# ---------------------------------------------------------------- 6. 輪詢進度
+
+# 由實際回應確認：欄位是 state（不是 status），值為 IN_PROGRESS / OK。
+# 失敗時的字串尚未實測，先放寬比對範圍。
+SUCCESS_STATES = {"OK", "SUCCESS", "SUCCESSFUL", "FINISHED", "DONE", "COMPLETED"}
+FAILURE_STATES = {"ERROR", "FAILED", "FAILURE", "KO", "CANCELLED", "CANCELED"}
+RUNNING_STATES = {"IN_PROGRESS", "RUNNING", "PENDING", "QUEUED", "STARTED"}
+
+
+# 核心部署工作。這幾項失敗代表 VQL 沒有正確套用。
+CORE_TASK_TYPES = {"PROMOTION_CONFIG", "VQL_TRANSACTIONAL", "VQL_COMMIT"}
+
+# 輔助工作。失敗不影響過版結果，但仍需提醒查看。
+# 例如 Data Catalog / Data Marketplace 同步失敗時，
+# 物件已正確部署到 VDP，只是目錄服務尚未同步。
+AUXILIARY_TASK_TYPES = {"DATACATALOG_SYNC"}
+
+
+def _summarize_tasks(tasks):
+    """整理各項 task，回傳 (摘要行, 失敗的核心工作, 失敗的輔助工作)。
+
+    tasks 由新到舊排列，依 id 排序後才是執行順序。
+    """
+    lines, core_failed, aux_failed = [], [], []
+
+    for t in sorted(tasks, key=lambda x: x.get("id", 0)):
+        st = str(t.get("state", "")).upper()
+        ttype = str(t.get("deploymentExecutionType", ""))
+        lines.append("  [%s] %s（%s）" % (st, t.get("name", ""), ttype))
+
+        out = (t.get("output") or "").strip()
+        for ln in out.splitlines():
+            if ln.strip():
+                lines.append("      %s" % ln.strip())
+
+        if st in FAILURE_STATES:
+            if ttype in AUXILIARY_TASK_TYPES:
+                aux_failed.append(t)
+            else:
+                core_failed.append(t)
+
+    return lines, core_failed, aux_failed
+
+
+def _error_digest(text, max_lines=40):
+    """把冗長的 SM 錯誤輸出濃縮成重點。
+
+    VQL 部署失敗時，輸出會夾帶整段失敗的語句（動輒數百行）。
+    只保留 Command / Statement 的第一行與 ERROR 行；若一行都沒有，
+    退回顯示前幾行。完整內容仍在「完整回應」那行 log 裡。
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    keep = [ln for ln in lines
+            if re.match(r"(ERROR|Command|Statement:)", ln, re.IGNORECASE)]
+    if not keep:
+        keep = lines[:max_lines]
+    return [ln[:200] for ln in keep[:max_lines]]
+
+
+def _log_task_errors(tasks, level):
+    """輸出失敗 task 的錯誤內容。level 為 error 或 warning。"""
+    for t in tasks:
+        err = (t.get("error") or t.get("output") or "").strip()
+        log("##[%s]%s（%s）未成功"
+            % (level, t.get("name"), t.get("deploymentExecutionType")))
+        for ln in _error_digest(err):
+            log("##[%s]    %s" % (level, ln))
+
+
+def _warn_if_rollback_disabled(tasks):
+    """VQL 部署失敗時，若環境停用 rollback，已執行的指令可能已生效。"""
+    for t in tasks:
+        if (t.get("deploymentExecutionType") == "VQL_ROLLBACK"
+                and str(t.get("state", "")).upper() == "SKIPPED"
+                and "disabled" in str(t.get("output", "")).lower()):
+            log("##[warning]目標環境的部署設定停用了 rollback，失敗之前已成功執行的"
+                "指令不會被自動還原，請直接檢查目標環境的實際狀態。")
+            return
+
+
+def wait_for_deployment(deployment_id, timeout_sec=900, interval=10):
+    """輪詢直到部署結束。
+
+    這是內層輪詢，必須等到部署真正結束，pipeline 這個 run 才結束，
+    呼叫端的外層輪詢才不會過早回報成功。
+
+    兩個由實測確認的重點：
+      1. 不可用 progress 百分比判斷完成。progress 會先到 100，
+         但 state 仍為 IN_PROGRESS（最後的 commit 尚未結束）。
+      2. 成敗以整體 state 為準，而非個別 task。輔助工作
+         （如 Data Catalog 同步）失敗時，整體仍會是 OK，
+         此時過版本身已成功，只需提醒查看。
+    """
+    log("")
+    log("--- 輪詢部署進度 ---")
+    deadline = time.time() + timeout_sec
+    last_signature = None
+
+    while time.time() < deadline:
+        resp = _request("GET", "/deployments/%s/progress" % deployment_id)
+
+        try:
+            progress = resp.json()
+        except ValueError:
+            log("進度回應非 JSON：%s" % resp.text[:500])
+            time.sleep(interval)
+            continue
+
+        state = str(progress.get("state", "")).upper()
+        pct = progress.get("progress", "?")
+        tasks = progress.get("tasks") or []
+        lines, core_failed, aux_failed = _summarize_tasks(tasks)
+
+        signature = (state, tuple(lines))
+        if signature != last_signature:
+            log("")
+            log("整體狀態：%s（%s%%）" % (state or "(無 state 欄位)", pct))
+            for ln in lines:
+                log(ln)
+            last_signature = signature
+
+        if state in SUCCESS_STATES:
+            warn_msg = (progress.get("warningMessage") or "").strip()
+
+            if core_failed:
+                # 整體 OK 但核心工作失敗，兩者矛盾，從嚴處理
+                log("")
+                _log_task_errors(core_failed, "error")
+                fail("整體狀態為 %s，但核心部署工作未成功，請確認實際結果。"
+                     "deploymentId=%s" % (state, deployment_id))
+
+            if aux_failed or warn_msg:
+                log("")
+                if warn_msg:
+                    log("##[warning]%s" % warn_msg)
+                _log_task_errors(aux_failed, "warning")
+                names = "、".join(t.get("name", "") for t in aux_failed)
+                note = ("過版已完成，但有附帶工作未成功：%s。"
+                        "請查看訊息並確認是否需要人工處理。" % names
+                        if aux_failed else warn_msg)
+                log("##vso[task.setvariable variable=deployWarning]%s" % note)
+                log("")
+                log("部署完成（含警告）")
+                return progress
+
+            log("")
+            log("部署完成")
+            return progress
+
+        if state in FAILURE_STATES:
+            log("")
+            _log_task_errors(core_failed + aux_failed, "error")
+            _warn_if_rollback_disabled(tasks)
+            log("完整回應：%s"
+                % json.dumps(progress, ensure_ascii=False)[:2000])
+            fail("部署失敗：state=%s，deploymentId=%s" % (state, deployment_id))
+
+        if state and state not in RUNNING_STATES:
+            log("##[warning]未知的狀態值 %s，視為進行中繼續等待。"
+                "請回報此值以便納入判斷。" % state)
+
+        time.sleep(interval)
+
+    fail("部署逾時（%d 秒），deploymentId=%s，"
+         "請至 Solution Manager 確認實際狀態" % (timeout_sec, deployment_id))
+
+
+# ---------------------------------------------------------------- 主流程
+
+STAGES = ["environments", "servers", "revision", "validate", "deploy"]
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Denodo Solution Manager CI deployment via APIM")
+    ap.add_argument("--stage", default="environments", choices=STAGES,
+                    help="執行到哪一階段為止，用於分段驗證")
+    ap.add_argument("--name", default="", help="Revision 名稱")
+    ap.add_argument("--description", default="", help="Revision 說明")
+    ap.add_argument("--components", default="",
+                    help="要過版的資料表清單，逗號分隔，須帶 database 前綴"
+                         "（如 admin.rv_x,sap.rv_y）。"
+                         "指定後會呼叫 DESC API 取得展開相依的完整 VQL")
+    ap.add_argument("--desc-options", default="",
+                    help="DESC VQL 匯出選項，格式 key=value,key2=value2。"
+                         "留空則使用預設值（見 DEFAULT_DESC_OPTIONS）")
+    ap.add_argument("--desc-api-path", default="/descVql",
+                    help="APIM 上 DESC API 的路徑（接在 SM 前綴之後）")
+    ap.add_argument("--desc-response-file", default="",
+                    help="模擬用：repo 內存放的 DESC 回傳檔（JSON）。指定後不呼叫 "
+                         "APIM，改讀此檔，其餘流程相同。--components 可省略，"
+                         "會由檔內的 requested_name 取得")
+    ap.add_argument("--desc-literal-response-file", default="",
+                    help="模擬用：同一批 view 以 includeProperties=no 取得的 DESC 回傳檔，"
+                         "用來推得 properties。非模擬模式會自動呼叫第二次 DESC API，不需要此參數")
+    ap.add_argument("--vql-file", default="",
+                    help="repo 內的 VQL 檔路徑，腳本自行讀檔並轉 base64（建議）")
+    ap.add_argument("--properties-file", default="",
+                    help="repo 內的 properties 檔路徑，同上。"
+                         "DESC 回傳檔已帶 properties 時不需要")
+    ap.add_argument("--vql-base64", default="",
+                    help="直接傳入 base64 字串。大檔請改用 --vql-file")
+    ap.add_argument("--properties-base64", default="",
+                    help="直接傳入 base64 字串。大檔請改用 --properties-file")
+    ap.add_argument("--environment", "--environment-id", dest="environment",
+                    default="",
+                    help="目標環境，可填名稱（如 ACLDTPLTFRM-PRD）或數字 id")
+    ap.add_argument("--cluster-id", default="",
+                    help="選填。留空則由目標環境的 server 清單自動推導")
+    ap.add_argument("--create-datasources", default="*",
+                    help="哪些 datasource 由 VQL 建立／覆蓋。* = DESC 帶出的全部放行（預設），"
+                         "PRD 的值交給 SM 的環境屬性機制；- = 全部從 VQL 剔除，PRD 既有的完全不動；"
+                         "或逗號分隔的 db.ds / ds 清單，只放行列出的，其餘剔除")
+    ap.add_argument("--allow-fallback-for", default="",
+                    help="逗號分隔。被規則擋下的變數，名稱含其中任一字串者改寫入 DEV 值")
+    ap.add_argument("--fallback-policy", default="new-elements",
+                    choices=("new-elements", "none"),
+                    help="建立 revision 前依目標環境已定義的屬性處理 ${變數}：new-elements（預設）"
+                         "已定義者保留、PRD 尚無的元素寫入 DEV 值；none：不處理，原樣送出")
+    ap.add_argument("--allow-revision-fallback", action="store_true",
+                    help="被規則擋下的變數一律改寫入 DEV 值。僅在明確確認後才開啟")
+    ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument("--interval", type=int, default=10)
+    args = ap.parse_args()
+
+    _check_env()
+
+    log("=" * 64)
+    log("Denodo SM 部署作業")
+    log("  stage            = %s" % args.stage)
+    log("  APIM base        = %s" % BASE_URL)
+    log("  subscription key = %s" % _mask(SUB_KEY, 6))
+    log("=" * 64)
+
+    # 每次執行都重新取得 token
+    get_token()
+
+    # 階段 1：環境清單
+    environments = list_environments()
+    if args.stage == "environments":
+        log("")
+        log("stage=environments，就此結束")
+        return
+
+    # 把名稱或 id 解析成實際的 environment id
+    if not args.environment or args.environment == "-":
+        fail("stage=%s 需要 --environment（名稱或 id）" % args.stage)
+    environment_id = resolve_environment_id(environments, args.environment)
+
+    # 階段 2：決定 clusterId
+    # 1) 有明確指定就直接用，不必呼叫 /servers
+    # 2) 未指定則嘗試由 /servers 推導
+    # 3) APIM 上若未發布 /servers，不中斷，改為不帶 clusterId 送出部署
+    cluster_id = None
+    if args.cluster_id and args.cluster_id != "-":
+        cluster_id = int(args.cluster_id)
+        log("")
+        log("使用指定的 clusterId = %s（略過 /servers 查詢）" % cluster_id)
+    else:
+        servers = list_servers(environment_id, allow_missing=True)
+        if servers:
+            cluster_id = pick_cluster_id(servers)
+        else:
+            log("")
+            log("##[warning]未取得 clusterId，部署將不指定 cluster，")
+            log("##[warning]由 Solution Manager 自行決定目標。")
+            log("##[warning]若需指定，請在 APIM 發布 /environments/{id}/servers，")
+            log("##[warning]或於 clusterId 參數明確填入。")
+
+    if args.stage == "servers":
+        log("")
+        log("stage=servers，就此結束")
+        log("後續部署可用：environmentId=%s clusterId=%s"
+            % (environment_id, cluster_id if cluster_id else "(未指定)"))
+        return
+
+    # 階段 3：建立 revision
+    placeholder = {"", "-"}
+
+    # VQL 來源，依序：DESC API > 檔案 > 直接傳入的 base64
+    components = [c.strip() for c in args.components.split(",")
+                  if c.strip() and c.strip() != "-"]
+
+    desc_file = (None if args.desc_response_file in placeholder
+                 else args.desc_response_file)
+    if desc_file and not components:
+        if not os.path.isfile(desc_file):
+            fail("找不到 DESC 回傳檔：%s" % desc_file)
+        components = requested_names(load_response_file(desc_file))
+        if not components:
+            fail("回傳檔中找不到 requested_name：%s" % desc_file)
+        log("由回傳檔取得 view 清單：%s" % ", ".join(components))
+
+    desc_props_b64 = None   # DESC 回應一併帶回的 properties（參數化 VQL）
+    parameterized = False   # VQL 是否為參數化格式（需要 properties）
+    if components:
+        desc_options = parse_desc_options(args.desc_options)
+        vql_b64, desc_props_b64, parameterized = fetch_vql_from_api(
+            components, args.desc_api_path, desc_options,
+            response_file=desc_file,
+            literal_response_file=(None if args.desc_literal_response_file in placeholder
+                                   else args.desc_literal_response_file),
+            create_datasources=[p.strip() for p in args.create_datasources.split(",")
+                                if p.strip() and p.strip() != "-"])
+    elif args.vql_file not in placeholder:
+        log("")
+        log("--- 讀取 VQL 檔案 ---")
+        vql_b64 = read_as_base64(args.vql_file, "VQL")
+    elif args.vql_base64 not in placeholder:
+        vql_b64 = args.vql_base64
+    else:
+        fail("stage=%s 需要 --components、--vql-file 或 --vql-base64 其一"
+             % args.stage)
+
+    # properties 來源，依序：--properties-file > --properties-base64 > DESC 回應
+    if args.properties_file not in placeholder:
+        props_b64 = read_as_base64(args.properties_file, "properties")
+    elif args.properties_base64 not in placeholder:
+        props_b64 = args.properties_base64
+    elif desc_props_b64:
+        props_b64 = desc_props_b64
+    else:
+        props_b64 = None
+
+    if parameterized and not props_b64:
+        fail("VQL 為參數化格式（REQUIRES-PROPERTIES-FILE），但沒有 properties。"
+             "請在 DESC 回傳檔的 properties 欄位，或以 propertiesFile 參數提供")
+
+    revision_name = args.name
+    if revision_name in placeholder:
+        if components:
+            revision_name = "deploy-%s" % ",".join(components)[:80]
+            log("未指定 revision 名稱，自動命名為：%s" % revision_name)
+        else:
+            fail("stage=%s 需要 --name" % args.stage)
+
+    # 建立 revision 前，依目標環境已定義的屬性處理 VQL 中的 ${變數}
+    if args.fallback_policy == "new-elements":
+        vql_before = base64.b64decode(vql_b64).decode("utf-8", errors="ignore")
+        vql_after = prepare_properties(
+            vql_before,
+            base64.b64decode(props_b64).decode("utf-8") if props_b64 else "",
+            environment_id,
+            allow_all=args.allow_revision_fallback,
+            allow_for=[p for p in args.allow_fallback_for.split(",")
+                       if p.strip() and p.strip() != "-"])
+        if vql_after != vql_before:
+            vql_b64 = base64.b64encode(vql_after.encode("utf-8")).decode("ascii")
+
+    revision_id = create_revision(
+        revision_name,
+        "" if args.description in placeholder else args.description,
+        vql_b64, props_b64)
+    log("##vso[task.setvariable variable=revisionId]%s" % revision_id)
+
+    if args.stage == "revision":
+        log("")
+        log("stage=revision，就此結束")
+        return
+
+    # 階段 4：驗證。失敗即中止，不往下部署。
+    desc_text = "" if args.description in placeholder else args.description
+    ok, summary, detail = validate_revision(revision_id, environment_id, desc_text)
+
+    # 輸出結構化結果，供呼叫端（bot）取用並呈現給使用者
+    log("##vso[task.setvariable variable=validationState]%s"
+        % detail.get("state", ""))
+    log("##vso[task.setvariable variable=validationSummary]%s" % summary)
+    log("")
+    log("驗證結果摘要：%s" % json.dumps(detail, ensure_ascii=False))
+
+    if not ok:
+        fail("驗證未通過，已中止部署。原因：%s" % summary)
+
+    if args.stage == "validate":
+        log("")
+        log("stage=validate，就此結束")
+        return
+
+    # 階段 5、6：部署並等待完成
+    deployment_id = start_deployment(
+        [revision_id], environment_id,
+        "" if args.description in placeholder else args.description)
+    log("##vso[task.setvariable variable=deploymentId]%s" % deployment_id)
+
+    wait_for_deployment(deployment_id, args.timeout, args.interval)
+
+    log("")
+    log("=" * 64)
+    log("全部完成　revision=%s deployment=%s" % (revision_id, deployment_id))
+    log("=" * 64)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

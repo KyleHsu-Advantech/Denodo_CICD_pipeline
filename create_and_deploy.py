@@ -37,9 +37,10 @@ import time
 
 import requests
 
-from desc_response import (DescError, extract_vql, load_response_file,
-                           requested_names)
+from desc_response import (DescError, derive_properties, extract_vql,
+                           load_response_file, requested_names)
 from vql_transform import transform_vql, format_stats
+from property_policy import classify_fallback
 
 
 BASE_URL = os.environ.get(
@@ -280,7 +281,8 @@ def _request(method, path, allow_404=False, **kwargs):
 
 def fetch_vql_from_api(components, api_path, options, database=None,
                        transform=True, keep_drop_types=False,
-                       response_file=None, create_datasources=None):
+                       response_file=None, create_datasources=None,
+                       literal_response_file=None):
     """呼叫 APIM 上的 DESC API，取回展開相依後的完整 VQL。
 
     一次送出全部 component，由 API 端合併去重後回傳單一份 VQL。
@@ -300,6 +302,13 @@ def fetch_vql_from_api(components, api_path, options, database=None,
     response_file 有值時，不呼叫 APIM，改讀 repo 內存放的回傳檔，
     其餘流程（檢核、加工、建立 revision、驗證、部署）完全相同。
     用於 DESC API 尚未上線時，以真實回傳內容模擬整條流程。
+
+    properties 的來源（參數化 VQL 才需要），依序：
+      1. DESC 回應本身的 properties 欄位
+      2. 再呼叫一次 DESC，選項改為 includeProperties=no，兩份逐行比對取出 DEV 的值
+         （Denodo 的 DESC VQL 只回傳 ${變數}，不回傳值，見 derive_properties）
+         模擬模式時改讀 literal_response_file。
+    最終 VQL 一律是參數化的那份；值只進 properties，PRD 用哪個值由 SM 決定。
 
     回傳 (vql_base64, properties_base64 或 None, 是否為參數化 VQL)。
     """
@@ -327,6 +336,14 @@ def fetch_vql_from_api(components, api_path, options, database=None,
         vql, desc = extract_vql(body, ctype, create_datasources=create_datasources)
     except DescError as exc:
         fail("DESC 回應驗證未通過：%s" % exc)
+    if desc and desc.parameterized and not desc.properties:
+        desc.properties = _properties_from_literal_desc(
+            desc, components, api_path, options, response_file,
+            literal_response_file, create_datasources)
+        if desc.properties:
+            desc.warnings = [w for w in desc.warnings
+                             if "carries no 'properties'" not in w]
+
     if desc:
         log("  DESC 檢核通過：%d 個 view、%d 條語句；datasource：DESC 帶出 %d 個、"
             "保留建立 %d 個、剔除 %d 個（交由目標環境既有的）、DESC 端排除 %d 個"
@@ -414,6 +431,52 @@ def fetch_vql_from_api(components, api_path, options, database=None,
         log("  properties %d bytes，base64 後 %d bytes" % (len(props_raw), len(props_b64)))
 
     return encoded, props_b64, bool(desc and desc.parameterized)
+
+
+def _properties_from_literal_desc(desc, components, api_path, options,
+                                  response_file, literal_response_file,
+                                  create_datasources):
+    """第二次 DESC（includeProperties=no），與參數化 VQL 比對後組出 properties 文字。
+
+    取不到時回傳 None，由後續「參數化卻沒有 properties」的檢查中止流程。
+    properties 內含加密後的密碼，只記錄數量，不記錄內容。
+    """
+    log("")
+    log("--- 取得 properties（第二次 DESC，includeProperties=no）---")
+    if literal_response_file:
+        if not os.path.isfile(literal_response_file):
+            fail("找不到 includeProperties=no 的 DESC 回傳檔：%s" % literal_response_file)
+        log("##[warning]模擬模式：讀取回傳檔 %s" % literal_response_file)
+        body, ctype = load_response_file(literal_response_file), "application/json"
+    elif response_file:
+        log("##[warning]模擬模式未提供 includeProperties=no 的回傳檔"
+            "（descLiteralResponseFile），無法推得 properties")
+        return None
+    else:
+        lit_options = dict(options, includeProperties="no")
+        resp = _request("POST", api_path,
+                        json={"views": components, "options": lit_options})
+        body, ctype = resp.text, resp.headers.get("Content-Type", "")
+
+    try:
+        _, lit = extract_vql(body, ctype, create_datasources=create_datasources)
+        if lit is None:
+            raise DescError("includeProperties=no response is not in descvqlbatch format")
+        if {n.lower() for n in lit.requested} != {n.lower() for n in desc.requested}:
+            raise DescError("the two DESC calls returned different views")
+        if lit.variables:
+            raise DescError("includeProperties=no output still contains ${variables}; "
+                            "the option did not reach Denodo")
+        props = derive_properties(desc.vql, lit.vql)
+    except DescError as exc:
+        fail("無法由兩次 DESC 推得 properties：%s" % exc)
+
+    n = sum(1 for ln in props.splitlines() if "=" in ln)
+    missing = [v for v in desc.variables if ("%s=" % v) not in props]
+    if missing:
+        fail("推得的 properties 缺少變數：%s" % ", ".join(missing))
+    log("  已推得 %d 項 properties（DEV 的值；PRD 實際採用哪個值由 SM 決定）" % n)
+    return props
 
 
 # ---------------------------------------------------------------- 1. 環境清單
@@ -594,7 +657,8 @@ def _fallback_allowed(name, patterns):
 
 
 def validate_revision(revision_id, environment_id, description,
-                      allow_revision_fallback=False, allow_fallback_for=None):
+                      allow_revision_fallback=False, allow_fallback_for=None,
+                      fallback_policy="new-elements", vql_text=""):
     """驗證 revision 是否可安全部署到目標環境。
 
     SM 即使驗證失敗也可能回 HTTP 200，因此必須檢查回應內容，
@@ -608,6 +672,12 @@ def validate_revision(revision_id, environment_id, description,
           這會讓開發環境的設定進入正式環境，預設視為錯誤
       missingSchPropertiesWithServerValues
           同第一項，但針對 Scheduler
+
+    fallback_policy 決定第二項的處理：
+      new-elements  只放行「整個元素在 PRD 都不存在」的屬性（新 datasource 及其 base view），
+                    PRD 既有元素的屬性一律不准套用 DEV 值（見 property_policy）
+      none          全部視為錯誤（舊行為）
+    allow_fallback_for / allow_revision_fallback 為人工覆寫，優先於上述判斷。
 
     回傳 (ok: bool, summary: str, detail: dict)。
     """
@@ -664,13 +734,26 @@ def validate_revision(revision_id, environment_id, description,
                     % (len(names), ", ".join(str(n) for n in names[:3]),
                        " 等" if len(names) > 3 else ""))
 
+        with_server_names = list(v.get("missingVqlPropertiesWithServerValues") or {})
         if allow_revision_fallback:
-            log("##[warning]%s，已依設定放行" % _summary(use_rev))
+            allowed_fb = list(use_rev)
+            log("##[warning]%s，已依 allowRevisionFallback 全部放行" % _summary(use_rev))
         else:
-            allowed_fb = [n for n in use_rev if _fallback_allowed(n, patterns)]
-            blocked = [n for n in use_rev if n not in allowed_fb]
-            if allowed_fb:
-                log("##[warning]%s，已依 allowFallbackFor 放行" % _summary(allowed_fb))
+            manual = [n for n in use_rev if _fallback_allowed(n, patterns)]
+            rest = [n for n in use_rev if n not in manual]
+            if fallback_policy == "new-elements":
+                auto, blocked, reasons = classify_fallback(rest, with_server_names, vql_text)
+            else:
+                auto, blocked, reasons = [], rest, {}
+            allowed_fb = manual + auto
+            if auto:
+                log("##[warning]%s：屬於 PRD 尚不存在的新元素，將直接使用開發環境的值"
+                    % _summary(auto))
+            if manual:
+                log("##[warning]%s，已依 allowFallbackFor 放行" % _summary(manual))
+            for n in blocked:
+                if n in reasons:
+                    log("##[error]  %s：%s" % (n, reasons[n]))
             if blocked:
                 problems.append(
                     _summary(blocked)
@@ -977,6 +1060,9 @@ def main():
                     help="模擬用：repo 內存放的 DESC 回傳檔（JSON）。指定後不呼叫 "
                          "APIM，改讀此檔，其餘流程相同。--components 可省略，"
                          "會由檔內的 requested_name 取得")
+    ap.add_argument("--desc-literal-response-file", default="",
+                    help="模擬用：同一批 view 以 includeProperties=no 取得的 DESC 回傳檔，"
+                         "用來推得 properties。非模擬模式會自動呼叫第二次 DESC API，不需要此參數")
     ap.add_argument("--vql-file", default="",
                     help="repo 內的 VQL 檔路徑，腳本自行讀檔並轉 base64（建議）")
     ap.add_argument("--properties-file", default="",
@@ -998,6 +1084,10 @@ def main():
     ap.add_argument("--allow-fallback-for", default="",
                     help="逗號分隔。屬性名稱含其中任一字串者，允許回退使用來源端（DEV）的值，"
                          "其餘仍視為錯誤。用於第一次上線的新 datasource（填其名稱）")
+    ap.add_argument("--fallback-policy", default="new-elements",
+                    choices=("new-elements", "none"),
+                    help="new-elements（預設）：PRD 尚不存在的 datasource 與其 base view 自動使用 "
+                         "DEV 的值，PRD 既有元素一律不准套用 DEV 值；none：全部視為錯誤")
     ap.add_argument("--allow-revision-fallback", action="store_true",
                     help="允許屬性回退使用來源端（DEV）的值。"
                          "預設視為錯誤並中止，僅在明確確認後才開啟")
@@ -1083,6 +1173,8 @@ def main():
             transform=not args.no_transform,
             keep_drop_types=args.keep_drop_types,
             response_file=desc_file,
+            literal_response_file=(None if args.desc_literal_response_file in placeholder
+                                   else args.desc_literal_response_file),
             create_datasources=[p.strip() for p in args.create_datasources.split(",")
                                 if p.strip() and p.strip() != "-"])
     elif args.vql_file not in placeholder:
@@ -1134,7 +1226,9 @@ def main():
         "" if args.description in placeholder else args.description,
         allow_revision_fallback=args.allow_revision_fallback,
         allow_fallback_for=[p for p in args.allow_fallback_for.split(",")
-                            if p.strip() and p.strip() != "-"])
+                            if p.strip() and p.strip() != "-"],
+        fallback_policy=args.fallback_policy,
+        vql_text=base64.b64decode(vql_b64).decode("utf-8", errors="ignore"))
 
     # 輸出結構化結果，供呼叫端（bot）取用並呈現給使用者
     log("##vso[task.setvariable variable=validationState]%s"

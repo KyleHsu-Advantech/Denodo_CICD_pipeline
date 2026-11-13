@@ -697,9 +697,28 @@ def validate_revision(revision_id, environment_id, description,
     if state and state != "OK":
         problems.append("整體驗證狀態為 %s" % state)
     if vql_result and vql_result != "OK":
+        # errorVqlValidation 只是概述；outputVqlValidation 才列出是哪些屬性
+        err = (v.get("errorVqlValidation") or "").strip()
+        out = (v.get("outputVqlValidation") or "").strip()
+        log("")
+        log("##[error]SM VQL 驗證輸出：")
+        for ln in (out or err or vql_result).splitlines():
+            if ln.strip():
+                log("##[error]  %s" % ln.strip()[:300])
+        lines = [ln.strip() for ln in (err or out).splitlines()
+                 if ln.strip() and not ln.strip().startswith("Error validating revision")]
         problems.append("VQL 驗證失敗：%s"
-                        % (v.get("errorVqlValidation")
-                           or v.get("outputVqlValidation") or vql_result))
+                        % (v.get("messageResult") or (lines[0] if lines else vql_result)).strip())
+
+    # 回應中其他 missing* 欄位（不同 SM 版本欄位名稱不一），只記錄屬性名稱，不記錄值
+    for key in sorted(v):
+        if key.startswith("missing") and key not in (
+                "missingVqlPropertiesUseRevisionValues",
+                "missingVqlPropertiesWithServerValues",
+                "missingSchPropertiesWithServerValues") and v[key]:
+            names = list(v[key])
+            log("##[warning]%s（%d 項）：%s" % (key, len(names),
+                                             ", ".join(str(n) for n in names[:20])))
     if sch_result and sch_result != "OK":
         problems.append("Scheduler 驗證失敗：%s"
                         % (v.get("errorSchValidation")
@@ -775,6 +794,7 @@ def validate_revision(revision_id, environment_id, description,
         "allowedFallback": list(allowed_fb),
         "withServerValues": list(with_server),
         "message": v.get("messageResult", ""),
+        "vqlValidationOutput": (v.get("outputVqlValidation") or "")[:1000],
     }
 
     if problems:

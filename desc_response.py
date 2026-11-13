@@ -94,6 +94,23 @@ def _has_plaintext_password(block):
     return False
 
 
+def neutralize_comment_placeholders(vql):
+    """把 # 註解行裡的 ${x} 改寫成 <x>。回傳 (新 VQL, 改寫處數)。
+
+    Solution Manager 解析變數時不會跳過註解，descvqlbatch 檔頭的說明文字
+    "environment values are ${...} variables" 會讓 SM 要求一個名為 "..." 的屬性。
+    註解不影響執行，改寫是安全的；非註解行完全不動。
+    """
+    count = 0
+    out = []
+    for line in vql.splitlines(keepends=True):
+        if line.lstrip().startswith("#") and PLACEHOLDER_RE.search(line):
+            line, n = PLACEHOLDER_RE.subn(lambda m: "<%s>" % m.group(1), line)
+            count += n
+        out.append(line)
+    return "".join(out), count
+
+
 def parse_properties(text):
     """key=value lines of a properties file -> dict (comments and blank lines ignored)."""
     props = {}
@@ -232,7 +249,12 @@ def parse_desc_response(payload, dev_marker="ACLDTPLTFRM-DEV", strict_count=True
             return n in wanted or bool(db and f"{db}.{n}".lower() in wanted)
 
         out_vql, kept, stripped = _strip_datasources(vql, keep)
-    # # 註解行不算（descvqlbatch 的檔頭說明文字本身就含 "${...}"）
+    # 註解裡的 ${...} 也會被 SM 當成屬性（實測：SM 回報缺少屬性 "..."），送出前改寫掉
+    out_vql, n_neutralized = neutralize_comment_placeholders(out_vql)
+    if n_neutralized:
+        warnings.append(f"rewrote {n_neutralized} ${{...}} placeholder(s) inside # comments; "
+                        "SM would otherwise treat them as required properties")
+    # 註解行不算變數
     variables = sorted(set(PLACEHOLDER_RE.findall(
         "\n".join(ln for ln in out_vql.splitlines() if not ln.lstrip().startswith("#")))))
     parameterized = bool(REQUIRES_PROPS_RE.search(vql)) or bool(variables)

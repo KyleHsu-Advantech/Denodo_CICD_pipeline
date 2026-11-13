@@ -232,7 +232,9 @@ def parse_desc_response(payload, dev_marker="ACLDTPLTFRM-DEV", strict_count=True
             return n in wanted or bool(db and f"{db}.{n}".lower() in wanted)
 
         out_vql, kept, stripped = _strip_datasources(vql, keep)
-    variables = sorted(set(PLACEHOLDER_RE.findall(out_vql)))
+    # # 註解行不算（descvqlbatch 的檔頭說明文字本身就含 "${...}"）
+    variables = sorted(set(PLACEHOLDER_RE.findall(
+        "\n".join(ln for ln in out_vql.splitlines() if not ln.lstrip().startswith("#")))))
     parameterized = bool(REQUIRES_PROPS_RE.search(vql)) or bool(variables)
     if kept and parameterized:
         warnings.append(
@@ -301,6 +303,61 @@ def parse_desc_response(payload, dev_marker="ACLDTPLTFRM-DEV", strict_count=True
 
     return DescResult(out_vql, requested, excluded, actual, warnings, ds_included, stripped,
                       properties, parameterized, variables)
+
+
+def derive_properties(param_vql, literal_vql):
+    """由同一份清單的兩次 DESC 輸出推得 properties 檔內容（DEV 的值）。
+
+    param_vql:   'includeProperties' = 'yes' 的 VQL（含 ${變數}）
+    literal_vql: 'includeProperties' = 'no'  的 VQL（同位置是實際值）
+
+    兩份除了變數位置與 # 註解外結構相同，逐行比對：把參數化那行的 ${x}
+    換成擷取群組，對另一份同一行做整行比對，即可取出 x 的值。
+    密碼取出的是加密字串；PASSWORD 後面的 ${...PASSWORD.ENCRYPTED} 會對到 ENCRYPTED。
+
+    回傳 properties 文字（key=value，依名稱排序）。對不上時丟 DescError，絕不猜值。
+    """
+    def body(text):
+        return [ln.rstrip() for ln in text.splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")]
+
+    p_lines, l_lines = body(param_vql), body(literal_vql)
+    if len(p_lines) != len(l_lines):
+        raise DescError("includeProperties yes/no outputs differ in length (%d vs %d lines); "
+                        "the two DESC calls did not describe the same elements"
+                        % (len(p_lines), len(l_lines)))
+
+    values = {}
+    for no, (p, l) in enumerate(zip(p_lines, l_lines), 1):
+        names = PLACEHOLDER_RE.findall(p)
+        if not names:
+            if p != l:
+                raise DescError("includeProperties yes/no outputs differ at statement line %d" % no)
+            continue
+        pattern = "".join(
+            re.escape(part) if i % 2 == 0 else "(.*?)"
+            for i, part in enumerate(PLACEHOLDER_RE.split(p)))
+        m = re.fullmatch(pattern, l)
+        if not m:
+            raise DescError("cannot align variable(s) %s at statement line %d"
+                            % (", ".join(names), no))
+        for name, value in zip(names, m.groups()):
+            if value.strip("*") == "" and value:
+                raise DescError("DESC returned a masked value (********) for %s; the DESC user "
+                                "needs WRITE privilege on the element, not only METADATA" % name)
+            if name in values and values[name] != value:
+                raise DescError("variable %s has two different values in the literal VQL" % name)
+            values[name] = value
+
+    return "".join("%s=%s\n" % (k, _escape_property(values[k])) for k in sorted(values))
+
+
+def _escape_property(value):
+    """Java .properties 跳脫：反斜線、開頭空白、非 ASCII（SM 以 ISO-8859-1 讀檔時才不會亂碼）。"""
+    out = value.replace("\\", "\\\\")
+    if out[:1] == " ":
+        out = "\\" + out
+    return "".join(c if ord(c) < 128 else "\\u%04x" % ord(c) for c in out)
 
 
 def load_response_file(path):

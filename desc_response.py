@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Parse and validate a descvqlbatch response before it enters the deploy pipeline.
 
-Pipeline position:  DESC API  ->  desc_response.py  ->  vql_transform.py  ->  SM loadFromVQL
+Pipeline position:  DESC API  ->  desc_response.py  ->  SM loadFromVQL
 
 Usage:
     python desc_response.py desc.json --out merged.vql [--dev-marker ACLDTPLTFRM-DEV]

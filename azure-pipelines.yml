@@ -24,26 +24,6 @@ parameters:
     type: string
     default: '-'
 
-  # 已不需要。新版 DESC 輸出自帶各 database 的 CONNECT DATABASE。
-  # 僅在 DESC 輸出不含 CONNECT DATABASE（舊版輸出）時，
-  # 才會用這個值補上；一律留 - 即可。
-  - name: database
-    type: string
-    default: '-'
-
-  # VQL 加工（保險機制）。DESC 選項正確時輸出本來就不含 DROP，
-  # 此加工會偵測到無事可做而不變更內容；僅在選項未生效時才補救。
-  - name: transformVql
-    type: string
-    default: 'true'
-    values: ['true', 'false']
-
-  # 若驗證回報 CREATE OR REPLACE TYPE 語法錯誤，改為 true 讓 TYPE 保留原樣
-  - name: keepDropTypes
-    type: string
-    default: 'false'
-    values: ['false', 'true']
-
   # DESC VQL 的匯出選項，格式 key=value,key2=value2。
   # 留空使用預設：
   #   includeDependencies=yes                        一併匯出相依物件
@@ -157,20 +137,6 @@ variables:
   # 旗標型參數。條件式（if）不能直接寫在 arguments 這種字串值裡面，
   # 所以先在這裡依參數產生旗標字串（開啟時為旗標，否則為空字串），
   # 再於 arguments 以 variables.xxx 的範本運算式帶入。
-  - ${{ if eq(parameters.transformVql, 'false') }}:
-      - name: noTransformFlag
-        value: '--no-transform'
-  - ${{ if ne(parameters.transformVql, 'false') }}:
-      - name: noTransformFlag
-        value: ''
-
-  - ${{ if eq(parameters.keepDropTypes, 'true') }}:
-      - name: keepDropTypesFlag
-        value: '--keep-drop-types'
-  - ${{ if ne(parameters.keepDropTypes, 'true') }}:
-      - name: keepDropTypesFlag
-        value: ''
-
   - ${{ if eq(parameters.allowRevisionFallback, 'true') }}:
       - name: allowRevisionFallbackFlag
         value: '--allow-revision-fallback'
@@ -210,9 +176,6 @@ steps:
         --desc-response-file "${{ parameters.descResponseFile }}"
         --desc-literal-response-file "${{ parameters.descLiteralResponseFile }}"
         --desc-options "${{ parameters.descOptions }}"
-        --database "${{ parameters.database }}"
-        ${{ variables.noTransformFlag }}
-        ${{ variables.keepDropTypesFlag }}
         --environment "${{ parameters.environment }}"
         --cluster-id "${{ parameters.clusterId }}"
         --name "${{ parameters.revisionName }}"
